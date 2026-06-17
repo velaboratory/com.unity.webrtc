@@ -20,6 +20,7 @@
 #elif UNITY_ANDROID
 #include "Android/AndroidCodecFactoryHelper.h"
 #include "Android/Jni.h"
+#include "Codec/AhbCodec/AhbH264DecoderFactory.h"
 #endif
 
 namespace unity
@@ -90,6 +91,14 @@ namespace webrtc
 #if UNITY_ANDROID
             if (IsVMInitialized())
                 return CreateAndroidDecoderFactory().release();
+#endif
+        }
+
+        if (impl == kAhbH264Impl)
+        {
+#if UNITY_ANDROID
+            if (IsVMInitialized())
+                return CreateAhbH264DecoderFactory().release();
 #endif
         }
 

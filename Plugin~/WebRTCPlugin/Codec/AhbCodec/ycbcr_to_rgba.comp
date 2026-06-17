@@ -1,0 +1,33 @@
+#version 450
+//
+// YUV(ycbcr) -> RGBA8 convert for the zero-copy H.264 decoder.
+//
+// binding 0 is a combined image sampler whose IMMUTABLE sampler carries the
+// VkSamplerYcbcrConversion (baked into the descriptor-set-layout), so sampling
+// returns RGB with the vendor YUV->RGB conversion already applied. binding 1 is
+// the plain RGBA8 storage image Unity will display.
+//
+// Regenerate SPIR-V (NDK glslc) -> embedded header:
+//   $NDK/shader-tools/darwin-x86_64/glslc -O ycbcr_to_rgba.comp -mfmt=c -o ycbcr_to_rgba.spv.h
+//
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uYcbcr;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D uOut;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uOut);
+    if (p.x >= size.x || p.y >= size.y)
+        return;
+
+    // Compute shader has no implicit derivatives; sample explicit LOD 0.
+    vec2 uv = (vec2(p) + 0.5) / vec2(size);
+    vec3 rgb = textureLod(uYcbcr, uv, 0.0).rgb;
+
+    // Unity's receive texture origin is top-left vs the video's bottom-left, so flip Y
+    // (the old CPU path passed a negative height to libyuv for the same reason). Write
+    // .bgr because Unity's RGBA texture is sampled as B8G8R8A8 on this device.
+    imageStore(uOut, ivec2(p.x, size.y - 1 - p.y), vec4(rgb.bgr, 1.0));
+}

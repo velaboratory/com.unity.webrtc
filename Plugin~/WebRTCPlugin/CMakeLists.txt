@@ -207,7 +207,7 @@ elseif(Android)
   target_compile_definitions(WebRTCLib PUBLIC WEBRTC_ANDROID WEBRTC_POSIX
                                               VK_NO_PROTOTYPES)
   target_link_libraries(WebRTCLib PRIVATE ${WEBRTC_LIBRARY} log OpenSLES GLESv3
-                                          EGL)
+                                          EGL mediandk android nativewindow)
   target_compile_options(WebRTCLib PUBLIC -fno-lto -fno-rtti -fPIC)
 
   # Linker excludes unused symbols from the shared library when linking the

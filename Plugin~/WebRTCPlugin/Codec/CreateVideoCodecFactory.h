@@ -14,6 +14,9 @@ namespace webrtc
     constexpr char kNvCodecImpl[] = "NvCodec";
     constexpr char kAndroidMediaCodecImpl[] = "MediaCodec";
     constexpr char kVideoToolboxImpl[] = "VideoToolbox";
+    // Custom zero-copy H.264 decoder (Android). Its key sorts before "MediaCodec"
+    // in the factory std::map, so it wins H.264 selection.
+    constexpr char kAhbH264Impl[] = "AhbH264";
 
     constexpr char kSdpKeyNameCodecImpl[] = "implementation_name";
 

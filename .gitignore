@@ -389,3 +389,9 @@ Runtime/Plugins/x86_64/*.pdb.meta
 
 
 
+
+# AHB zero-copy plugin build artifacts (regenerable via BuildScripts~/build_ahb_plugin.sh)
+Plugin~/build-arm64/
+Plugin~/webrtc/
+webrtc.zip
+Runtime/Plugins/Android/libwebrtc.so

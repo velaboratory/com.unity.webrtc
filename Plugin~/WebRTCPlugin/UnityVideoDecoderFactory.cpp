@@ -76,7 +76,7 @@ namespace webrtc
         , factories_()
     {
         const std::vector<std::string> arrayImpl = {
-            kInternalImpl, kNvCodecImpl, kAndroidMediaCodecImpl, kVideoToolboxImpl
+            kAhbH264Impl, kInternalImpl, kNvCodecImpl, kAndroidMediaCodecImpl, kVideoToolboxImpl
         };
 
         for (auto impl : arrayImpl)

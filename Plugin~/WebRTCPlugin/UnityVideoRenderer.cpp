@@ -33,7 +33,13 @@ namespace webrtc
 
         if (frame_buffer->type() == webrtc::VideoFrameBuffer::Type::kNative)
         {
+#if !UNITY_ANDROID
             frame_buffer = frame_buffer->ToI420();
+#endif
+            // On Android this is our AhbDisplayBuffer carrying the decoder id; keep it so the
+            // batch Decode branch can copy the decoder's zero-copy RGBA image into the
+            // texture (instead of the CPU ToI420 path). In this pipeline only our decoder
+            // emits kNative buffers.
         }
         SetFrameBuffer(frame_buffer, frame.timestamp_us());
     }
