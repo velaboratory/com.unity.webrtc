@@ -22,21 +22,6 @@ namespace webrtc
         uint32_t DivUp(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
     } // namespace
 
-    bool AhbConvertPass::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags, uint32_t* outIndex)
-    {
-        VkPhysicalDeviceMemoryProperties props = {};
-        vkGetPhysicalDeviceMemoryProperties(m_phys, &props);
-        for (uint32_t i = 0; i < props.memoryTypeCount; i++)
-        {
-            if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & flags) == flags)
-            {
-                *outIndex = i;
-                return true;
-            }
-        }
-        return false;
-    }
-
     bool AhbConvertPass::BuildPipeline(VkSampler ycbcrSampler)
     {
         VkSampler immutable = ycbcrSampler;
@@ -127,7 +112,6 @@ namespace webrtc
                 return false;
             }
         }
-
         return true;
     }
 
@@ -146,65 +130,31 @@ namespace webrtc
         return BuildPipeline(ycbcrSampler);
     }
 
-    bool AhbConvertPass::AllocSlotImage(Slot& s, uint32_t w, uint32_t h)
+    VkImageView AhbConvertPass::EnsureDstView(VkImage dstImage)
     {
-        VkImageCreateInfo ici = {};
-        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-        ici.extent = { w, h, 1 };
-        ici.mipLevels = 1;
-        ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(m_device, &ici, nullptr, &s.image) != VK_SUCCESS)
-        {
-            AHB_LOG("AllocSlotImage vkCreateImage failed");
-            return false;
-        }
-
-        VkMemoryRequirements req = {};
-        vkGetImageMemoryRequirements(m_device, s.image, &req);
-        uint32_t typeIndex = 0;
-        if (!FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
-        {
-            AHB_LOG("AllocSlotImage no device-local memory type");
-            return false;
-        }
-        VkMemoryAllocateInfo mai = {};
-        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = typeIndex;
-        if (vkAllocateMemory(m_device, &mai, nullptr, &s.memory) != VK_SUCCESS)
-        {
-            AHB_LOG("AllocSlotImage vkAllocateMemory failed");
-            return false;
-        }
-        if (vkBindImageMemory(m_device, s.image, s.memory, 0) != VK_SUCCESS)
-        {
-            AHB_LOG("AllocSlotImage vkBindImageMemory failed");
-            return false;
-        }
+        if (dstImage == m_dstImage && m_dstView != VK_NULL_HANDLE)
+            return m_dstView;
+        if (m_dstView != VK_NULL_HANDLE)
+            vkDestroyImageView(m_device, m_dstView, nullptr);
+        m_dstView = VK_NULL_HANDLE;
+        m_dstImage = VK_NULL_HANDLE;
 
         VkImageViewCreateInfo vci = {};
         vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        vci.image = s.image;
+        vci.image = dstImage;
         vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vci.format = VK_FORMAT_R8G8B8A8_UNORM;
         vci.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY };
         vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        if (vkCreateImageView(m_device, &vci, nullptr, &s.view) != VK_SUCCESS)
+        if (vkCreateImageView(m_device, &vci, nullptr, &m_dstView) != VK_SUCCESS)
         {
-            AHB_LOG("AllocSlotImage vkCreateImageView failed");
-            return false;
+            AHB_LOG("EnsureDstView vkCreateImageView failed");
+            m_dstView = VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
         }
-
-        s.everConverted = false;
-        return true;
+        m_dstImage = dstImage;
+        return m_dstView;
     }
 
     void AhbConvertPass::RetireSlot(Slot& s)
@@ -216,62 +166,17 @@ namespace webrtc
         s.retireCtx = nullptr;
     }
 
-    void AhbConvertPass::FreeSlotImage(Slot& s)
+    bool AhbConvertPass::RecordInto(VkCommandBuffer cmd, VkImage srcImage, VkImageView srcView, VkImage dstImage,
+        uint32_t w, uint32_t h, uint64_t frameNumber, AhbRetireFn retire, void* retireCtx)
     {
-        if (s.view != VK_NULL_HANDLE)
-            vkDestroyImageView(m_device, s.view, nullptr);
-        if (s.image != VK_NULL_HANDLE)
-            vkDestroyImage(m_device, s.image, nullptr);
-        if (s.memory != VK_NULL_HANDLE)
-            vkFreeMemory(m_device, s.memory, nullptr);
-        s.view = VK_NULL_HANDLE;
-        s.image = VK_NULL_HANDLE;
-        s.memory = VK_NULL_HANDLE;
-    }
-
-    bool AhbConvertPass::EnsureOutputs(uint32_t w, uint32_t h)
-    {
-        if (m_outW == w && m_outH == h && m_slots[0].image != VK_NULL_HANDLE)
-            return true;
-
-        // Resolution change (or first use): drain + realloc. Caller guarantees the render
-        // thread, and Reclaim has freed completed inputs; for a resolution change we wait
-        // the device idle so no pending Unity submit still references the old images.
-        if (m_slots[0].image != VK_NULL_HANDLE)
-        {
-            vkDeviceWaitIdle(m_device);
-            for (int i = 0; i < kRing; i++)
-            {
-                RetireSlot(m_slots[i]);
-                FreeSlotImage(m_slots[i]);
-            }
-        }
-
-        m_outW = w;
-        m_outH = h;
-        for (int i = 0; i < kRing; i++)
-        {
-            if (!AllocSlotImage(m_slots[i], w, h))
-            {
-                AHB_LOG("EnsureOutputs failed at slot %d (%ux%u)", i, w, h);
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool AhbConvertPass::Record(VkCommandBuffer cmd, VkImage srcImage, VkImageView srcView, uint32_t w, uint32_t h,
-        uint64_t frameNumber, AhbRetireFn retire, void* retireCtx, ConvertedImage* out)
-    {
-        if (!IsReady() || cmd == VK_NULL_HANDLE || srcView == VK_NULL_HANDLE)
+        if (!IsReady() || cmd == VK_NULL_HANDLE || srcView == VK_NULL_HANDLE || dstImage == VK_NULL_HANDLE)
             return false;
-        if (!EnsureOutputs(w, h))
+        VkImageView dstView = EnsureDstView(dstImage);
+        if (dstView == VK_NULL_HANDLE)
             return false;
 
         Slot& s = m_slots[m_next];
-        // The next slot must already be reclaimed (its prior submit completed). If not, the
-        // GPU is more than kRing frames behind — skip this convert rather than overwrite.
-        if (s.inFlight)
+        if (s.inFlight) // GPU more than kRing frames behind — skip rather than overwrite
             return false;
         m_next = (m_next + 1) % kRing;
 
@@ -280,7 +185,7 @@ namespace webrtc
         srcInfo.imageView = srcView;
         srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         VkDescriptorImageInfo dstInfo = {};
-        dstInfo.imageView = s.view;
+        dstInfo.imageView = dstView;
         dstInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkWriteDescriptorSet writes[2] = {};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -297,8 +202,7 @@ namespace webrtc
         writes[1].pImageInfo = &dstInfo;
         vkUpdateDescriptorSets(m_device, 2, writes, 0, nullptr);
 
-        // src (imported AHB) UNDEFINED -> SHADER_READ_ONLY (content lives in the AHB,
-        // independent of Vulkan layout, so UNDEFINED preserves it).
+        // src (imported AHB) UNDEFINED -> SHADER_READ_ONLY (content lives in the AHB).
         VkImageMemoryBarrier toRead = {};
         toRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         toRead.srcAccessMask = 0;
@@ -309,56 +213,17 @@ namespace webrtc
         toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toRead.image = srcImage;
         toRead.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-        VkImageMemoryBarrier toGeneral = {};
-        toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        toGeneral.srcAccessMask = 0;
-        toGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        // The dispatch overwrites the entire image, so we never need the old contents — and
-        // the slot may currently be in SHADER_READ (last convert) or TRANSFER_SRC (after the
-        // display copy). UNDEFINED covers both.
-        toGeneral.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toGeneral.image = s.image;
-        toGeneral.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-        VkImageMemoryBarrier pre[2] = { toRead, toGeneral };
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-            0, nullptr, 2, pre);
+            0, nullptr, 1, &toRead);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeLayout, 0, 1, &s.set, 0, nullptr);
         vkCmdDispatch(cmd, DivUp(w, 8), DivUp(h, 8), 1);
 
-        VkImageMemoryBarrier toSampled = {};
-        toSampled.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        toSampled.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        toSampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        toSampled.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        toSampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        toSampled.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toSampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toSampled.image = s.image;
-        toSampled.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-            nullptr, 0, nullptr, 1, &toSampled);
-
         s.inFlight = true;
-        s.everConverted = true;
         s.recordedFrame = frameNumber;
         s.retire = retire;
         s.retireCtx = retireCtx;
-        m_lastSlot = (m_next + kRing - 1) % kRing; // the slot we just used
-
-        if (out)
-        {
-            out->image = s.image;
-            out->view = s.view;
-            out->width = w;
-            out->height = h;
-        }
         return true;
     }
 
@@ -371,28 +236,15 @@ namespace webrtc
         }
     }
 
-    bool AhbConvertPass::LastImage(VkImage* outImage, uint32_t* outW, uint32_t* outH) const
-    {
-        if (m_lastSlot < 0 || m_slots[m_lastSlot].image == VK_NULL_HANDLE)
-            return false;
-        *outImage = m_slots[m_lastSlot].image;
-        *outW = m_outW;
-        *outH = m_outH;
-        return true;
-    }
-
     void AhbConvertPass::Free()
     {
         if (m_device == VK_NULL_HANDLE)
             return;
-        // Teardown: ensure no pending Unity submit still references our images/inputs.
         vkDeviceWaitIdle(m_device);
         for (int i = 0; i < kRing; i++)
-        {
             RetireSlot(m_slots[i]);
-            FreeSlotImage(m_slots[i]);
-            m_slots[i].set = VK_NULL_HANDLE; // freed with the pool
-        }
+        if (m_dstView != VK_NULL_HANDLE)
+            vkDestroyImageView(m_device, m_dstView, nullptr);
         if (m_descPool != VK_NULL_HANDLE)
             vkDestroyDescriptorPool(m_device, m_descPool, nullptr);
         if (m_pipeline != VK_NULL_HANDLE)
@@ -401,12 +253,12 @@ namespace webrtc
             vkDestroyPipelineLayout(m_device, m_pipeLayout, nullptr);
         if (m_setLayout != VK_NULL_HANDLE)
             vkDestroyDescriptorSetLayout(m_device, m_setLayout, nullptr);
+        m_dstView = VK_NULL_HANDLE;
+        m_dstImage = VK_NULL_HANDLE;
         m_descPool = VK_NULL_HANDLE;
         m_pipeline = VK_NULL_HANDLE;
         m_pipeLayout = VK_NULL_HANDLE;
         m_setLayout = VK_NULL_HANDLE;
-        m_outW = 0;
-        m_outH = 0;
         m_next = 0;
     }
 

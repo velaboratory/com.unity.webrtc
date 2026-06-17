@@ -195,7 +195,22 @@ namespace webrtc
     {
         if (!out || !m_conversionReady)
             return false;
+        // The AImageReader recycles a small fixed pool of AHBs; import each ONCE and reuse
+        // the VkImage (it tracks the AHB's content across cycles). Avoids per-frame churn.
+        auto it = m_cache.find(ahb);
+        if (it != m_cache.end())
+        {
+            *out = it->second;
+            return true;
+        }
+        if (!ImportNew(ahb, width, height, out))
+            return false;
+        m_cache[ahb] = *out;
+        return true;
+    }
 
+    bool AhbVkImporter::ImportNew(AHardwareBuffer* ahb, uint32_t width, uint32_t height, AhbFrameImage* out)
+    {
         VkAndroidHardwareBufferFormatPropertiesANDROID fmtProps = {};
         VkAndroidHardwareBufferPropertiesANDROID ahbProps = {};
         if (!QueryFormat(m_getAhbProps, m_device, ahb, &fmtProps, &ahbProps))
@@ -283,6 +298,9 @@ namespace webrtc
 
     void AhbVkImporter::Shutdown()
     {
+        for (auto& kv : m_cache)
+            FreeImage(kv.second);
+        m_cache.clear();
         if (m_sampler != VK_NULL_HANDLE)
         {
             vkDestroySampler(m_device, m_sampler, nullptr);

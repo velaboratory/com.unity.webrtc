@@ -1,6 +1,8 @@
 #include "pch.h"
 
+#include <atomic>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <set>
 
@@ -45,16 +47,20 @@ namespace webrtc
         std::mutex g_convertMutex;
         std::set<AhbH264Decoder*> g_liveDecoders;
 
+        // rendererId -> decoder ptr. The renderer records this from each delivered frame's
+        // AhbDisplayBuffer (once per stream); C# pauses a stream's decode by rendererId
+        // (visibility) and we route it to the decoder. Guarded by g_convertMutex.
+        std::map<uint32_t, uint64_t> g_rendererToDecoder;
+
+        // Frees when a convert's frame completes: only releases the AImage back to the
+        // AImageReader (the VkImage is cached in the importer and reused, not freed).
         struct RetireCtx
         {
-            AhbVkImporter* importer;
-            AhbFrameImage fi;
             AImage* img;
         };
         void RetireInput(void* p)
         {
             auto* c = static_cast<RetireCtx*>(p);
-            c->importer->FreeImage(c->fi);
             AhbMediaCodec::ReleaseImage(c->img);
             delete c;
         }
@@ -108,6 +114,31 @@ namespace webrtc
                 if (mode_ < 2)
                     return inner_ ? inner_->Decode(input, missing_frames, render_time_ms) : WEBRTC_VIDEO_CODEC_ERROR;
 
+                // Off-screen: skip the MediaCodec decode entirely (idles the HW decoder).
+                // RTP still arrives, but no decode work — the big per-stream cost.
+                if (m_paused.load(std::memory_order_relaxed))
+                {
+                    if (!m_wasPaused)
+                        AHB_LOG("decode PAUSED (off-screen) decoder=%llu", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
+                    m_wasPaused = true;
+                    return WEBRTC_VIDEO_CODEC_OK;
+                }
+                // On resume, wait for a keyframe before decoding (C# asks the SFU for one),
+                // so we don't feed MediaCodec P-frames whose references we skipped.
+                if (m_wasPaused)
+                {
+                    AHB_LOG("decode RESUME (await keyframe) decoder=%llu", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
+                    m_wasPaused = false;
+                    m_needKeyframe = true;
+                }
+                if (m_needKeyframe)
+                {
+                    if (input._frameType == ::webrtc::VideoFrameType::kVideoFrameKey)
+                        m_needKeyframe = false;
+                    else
+                        return WEBRTC_VIDEO_CODEC_OK; // hold last frame until the keyframe
+                }
+
                 NativeDecode(input);
                 return WEBRTC_VIDEO_CODEC_OK; // recovery is libwebrtc's own (RTP/frame buffer)
             }
@@ -140,9 +171,11 @@ namespace webrtc
                 return info;
             }
 
-            // Render thread (under g_convertMutex via AhbDrainAllDecoders): reclaim completed
-            // inputs, then record the latest pending convert into Unity's command buffer.
-            void RenderThreadDrain(VkCommandBuffer cmd, uint64_t curFrame, uint64_t safeFrame)
+            // Render thread (under g_convertMutex via AhbConvertDecoderInto): reclaim
+            // completed inputs, then convert the latest pending frame DIRECTLY into Unity's
+            // receive texture `dstImage` (already transitioned to GENERAL) — one GPU pass,
+            // no slot, no copy.
+            void ConvertPendingInto(VkCommandBuffer cmd, VkImage dstImage, uint64_t curFrame, uint64_t safeFrame)
             {
                 convert_.Reclaim(safeFrame);
                 if (!pending_.valid)
@@ -159,62 +192,25 @@ namespace webrtc
                 AhbFrameImage fi = pending_.fi;
                 AImage* img = pending_.img;
                 pending_.valid = false;
-                const uint32_t w = fi.width;
-                const uint32_t h = fi.height;
 
                 bool recorded = false;
                 if (convert_.IsReady() && cmd != VK_NULL_HANDLE)
                 {
-                    auto* ctx = new RetireCtx{ &importer_, fi, img };
-                    ConvertedImage ci;
-                    recorded = convert_.Record(cmd, fi.image, fi.view, w, h, curFrame, &RetireInput, ctx, &ci);
+                    auto* ctx = new RetireCtx{ img };
+                    recorded = convert_.RecordInto(
+                        cmd, fi.image, fi.view, dstImage, fi.width, fi.height, curFrame, &RetireInput, ctx);
                     if (!recorded)
                     {
                         delete ctx;
-                        importer_.FreeImage(fi);
                         AhbMediaCodec::ReleaseImage(img);
                     }
                 }
                 else
                 {
-                    importer_.FreeImage(fi);
                     AhbMediaCodec::ReleaseImage(img);
                 }
                 if (recorded && (++convOk_ <= 3 || (convOk_ % 600) == 0))
-                    AHB_LOG("convert #%d %ux%u", convOk_, w, h);
-            }
-
-            // Render thread (under g_convertMutex via AhbCopyDecoderInto): copy our latest
-            // converted RGBA image into Unity's receive texture `dst`.
-            bool CopyLatestInto(VkCommandBuffer cmd, VkImage dst, uint32_t dstW, uint32_t dstH)
-            {
-                VkImage src = VK_NULL_HANDLE;
-                uint32_t w = 0, h = 0;
-                if (!convert_.LastImage(&src, &w, &h))
-                    return false;
-                if (w != dstW || h != dstH || src == VK_NULL_HANDLE)
-                    return false;
-
-                VkImageMemoryBarrier toSrc = {};
-                toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                toSrc.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                toSrc.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                toSrc.image = src;
-                toSrc.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                    nullptr, 0, nullptr, 1, &toSrc);
-
-                VkImageCopy region = {};
-                region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.extent = { w, h, 1 };
-                vkCmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-                return true;
+                    AHB_LOG("convert #%d %ux%u", convOk_, fi.width, fi.height);
             }
 
         private:
@@ -293,10 +289,7 @@ namespace webrtc
                         registered_ = true;
                     }
                     if (pending_.valid)
-                    {
-                        importer_.FreeImage(pending_.fi);
-                        AhbMediaCodec::ReleaseImage(pending_.img);
-                    }
+                        AhbMediaCodec::ReleaseImage(pending_.img); // drop the unconverted frame
                     pending_.fi = fi;
                     pending_.img = img;
                     pending_.valid = true;
@@ -324,7 +317,6 @@ namespace webrtc
                     registered_ = false;
                     if (pending_.valid)
                     {
-                        importer_.FreeImage(pending_.fi);
                         AhbMediaCodec::ReleaseImage(pending_.img);
                         pending_.valid = false;
                     }
@@ -350,6 +342,16 @@ namespace webrtc
             int cfgH_ = 0;
             int convOk_ = 0;
             int mode_ = 3;
+
+        public:
+            // Set from AhbSetStreamVisible (main thread) when the board goes off/on screen;
+            // read on the decode thread. Atomic so no per-frame lock on the decode path.
+            void SetPaused(bool paused) { m_paused.store(paused, std::memory_order_relaxed); }
+
+        private:
+            std::atomic<bool> m_paused{ false };
+            bool m_wasPaused = false;  // decode thread only
+            bool m_needKeyframe = false; // decode thread only
         };
 
         class AhbH264DecoderFactory : public ::webrtc::VideoDecoderFactory
@@ -396,15 +398,35 @@ namespace webrtc
         return std::make_unique<AhbH264DecoderFactory>();
     }
 
-    void AhbDrainAllDecoders(void* cmd, unsigned long long curFrame, unsigned long long safeFrame)
+    // The renderer records which decoder feeds it (once per stream, from the kNative
+    // frame's id) so C# can pause that decoder by rendererId.
+    void AhbMapRenderer(unsigned int rendererId, unsigned long long decoderId)
     {
-        VkCommandBuffer vkCmd = reinterpret_cast<VkCommandBuffer>(cmd);
         std::lock_guard<std::mutex> lock(g_convertMutex);
-        for (AhbH264Decoder* d : g_liveDecoders)
-            d->RenderThreadDrain(vkCmd, curFrame, safeFrame);
+        g_rendererToDecoder[rendererId] = decoderId;
+        AHB_LOG("map renderer %u -> decoder %llu", rendererId, decoderId);
     }
 
-    bool AhbCopyDecoderInto(unsigned long long id, void* cmd, void* dstImage, unsigned int w, unsigned int h)
+    // C# visibility hook: pause/resume the decoder feeding this renderer's board.
+    void AhbSetStreamVisible(unsigned int rendererId, int visible)
+    {
+        std::lock_guard<std::mutex> lock(g_convertMutex);
+        auto it = g_rendererToDecoder.find(rendererId);
+        if (it == g_rendererToDecoder.end())
+        {
+            AHB_LOG("SetVisible rid=%u vis=%d -> NO MAPPING yet", rendererId, visible);
+            return;
+        }
+        AhbH264Decoder* d = reinterpret_cast<AhbH264Decoder*>(static_cast<uintptr_t>(it->second));
+        bool live = g_liveDecoders.find(d) != g_liveDecoders.end();
+        AHB_LOG("SetVisible rid=%u vis=%d -> decoder %llu live=%d", rendererId, visible,
+            static_cast<unsigned long long>(it->second), live ? 1 : 0);
+        if (live)
+            d->SetPaused(visible == 0);
+    }
+
+    bool AhbConvertDecoderInto(
+        unsigned long long id, void* cmd, void* dstImage, unsigned long long curFrame, unsigned long long safeFrame)
     {
         AhbH264Decoder* d = reinterpret_cast<AhbH264Decoder*>(static_cast<uintptr_t>(id));
         VkCommandBuffer vkCmd = reinterpret_cast<VkCommandBuffer>(cmd);
@@ -412,7 +434,8 @@ namespace webrtc
         std::lock_guard<std::mutex> lock(g_convertMutex);
         if (g_liveDecoders.find(d) == g_liveDecoders.end())
             return false;
-        return d->CopyLatestInto(vkCmd, dst, w, h);
+        d->ConvertPendingInto(vkCmd, dst, curFrame, safeFrame);
+        return true;
     }
 
 } // namespace webrtc

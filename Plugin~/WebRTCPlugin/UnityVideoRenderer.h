@@ -39,6 +39,9 @@ namespace webrtc
         std::atomic<int64_t> m_timestamp;
         DelegateVideoFrameResize m_callback;
         bool m_needFlipVertical;
+#if UNITY_ANDROID
+        uint64_t m_lastMappedDecoder = 0; // AHB decoder->renderer map recorded once per stream
+#endif
     };
 
 } // end namespace webrtc

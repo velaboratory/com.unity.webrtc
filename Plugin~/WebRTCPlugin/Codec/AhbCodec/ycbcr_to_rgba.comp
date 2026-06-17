@@ -26,8 +26,13 @@ void main()
     vec2 uv = (vec2(p) + 0.5) / vec2(size);
     vec3 rgb = textureLod(uYcbcr, uv, 0.0).rgb;
 
-    // Unity's receive texture origin is top-left vs the video's bottom-left, so flip Y
-    // (the old CPU path passed a negative height to libyuv for the same reason). Write
-    // .bgr because Unity's RGBA texture is sampled as B8G8R8A8 on this device.
-    imageStore(uOut, ivec2(p.x, size.y - 1 - p.y), vec4(rgb.bgr, 1.0));
+    // The ycbcr conversion outputs gamma-encoded RGB (video transfer ~sRGB). The dst is a
+    // linear R8G8B8A8_UNORM RenderTexture sampled in Unity's Linear color space, so decode
+    // sRGB->linear here. This matches the old sRGB-texture path (Unity decoded on sample)
+    // that looked correct; without it the gamma values read as linear and look washed out.
+    vec3 lin = mix(rgb / 12.92, pow((rgb + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), rgb));
+
+    // Unity's texture origin is top-left vs the video's bottom-left, so flip Y (the old CPU
+    // path passed a negative height to libyuv for the same reason).
+    imageStore(uOut, ivec2(p.x, size.y - 1 - p.y), vec4(lin, 1.0));
 }

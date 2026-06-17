@@ -53,7 +53,6 @@ namespace webrtc
     static bool s_haveVulkanInstance = false;
 #if defined(SUPPORT_VULKAN)
     static std::unique_ptr<UnityGraphicsVulkan> s_unityVulkan;
-    static int s_ahbConvertEventID = 0;
 #endif
     const UnityVulkanInstance* GetUnityVulkanInstance()
     {
@@ -138,18 +137,8 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
             vulkan->ConfigureEvent(s_batchUpdateEventID, &batchUpdateEventConfig);
 
 #if UNITY_ANDROID
-            // A second per-frame event for the zero-copy H.264 convert. It records compute
-            // into Unity's command buffer (no own submit), so it needs the command buffer
-            // OUTSIDE a render pass, with no queue access (Unity submits it).
-            s_ahbConvertEventID = s_UnityInterfaces->Get<IUnityGraphics>()->ReserveEventIDRange(1);
-            UnityVulkanPluginEventConfig ahbConvertConfig;
-            ahbConvertConfig.graphicsQueueAccess = kUnityVulkanGraphicsQueueAccess_DontCare;
-            ahbConvertConfig.renderPassPrecondition = kUnityVulkanRenderPass_EnsureOutside;
-            ahbConvertConfig.flags = kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission |
-                kUnityVulkanEventConfigFlag_ModifiesCommandBuffersState;
-            vulkan->ConfigureEvent(s_ahbConvertEventID, &ahbConvertConfig);
-
-            // Keep the wrapper alive so the convert event can grab Unity's command buffer.
+            // Keep the wrapper alive so the batch Decode branch can grab Unity's command
+            // buffer + texture to convert the zero-copy H.264 frame straight into it.
             s_unityVulkan = std::move(vulkan);
 #endif
         }
@@ -369,9 +358,9 @@ static void UNITY_INTERFACE_API OnBatchUpdateEvent(int eventID, void* data)
 #if UNITY_ANDROID && defined(SUPPORT_VULKAN)
         else if (trackData->action == VideoStreamTrackAction::Decode)
         {
-            // Zero-copy receive: copy the decoder's converted RGBA image into the track
-            // texture, recorded into Unity's command buffer (no own submit). The renderer's
-            // current frame buffer is our id-carrying AhbDisplayBuffer.
+            // Zero-copy receive: convert the decoder's YUV frame DIRECTLY into the track
+            // texture (one compute pass, no copy), recorded into Unity's command buffer. The
+            // renderer's current frame buffer is our id-carrying AhbDisplayBuffer.
             UnityVideoRenderer* renderer = static_cast<UnityVideoRenderer*>(trackData->source);
             if (!renderer || !s_unityVulkan)
                 continue;
@@ -383,8 +372,8 @@ static void UNITY_INTERFACE_API OnBatchUpdateEvent(int eventID, void* data)
             VkImageSubresource subres { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
             s_unityVulkan->EnsureOutsideRenderPass();
             UnityVulkanImage dstImg = {};
-            if (!s_unityVulkan->AccessTexture(trackData->texture, &subres, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            if (!s_unityVulkan->AccessTexture(trackData->texture, &subres, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                     kUnityVulkanResourceAccess_PipelineBarrier, &dstImg))
                 continue;
 
@@ -392,8 +381,8 @@ static void UNITY_INTERFACE_API OnBatchUpdateEvent(int eventID, void* data)
             if (!s_unityVulkan->CommandRecordingState(&rec, kUnityVulkanGraphicsQueueAccess_DontCare))
                 continue;
 
-            unity::webrtc::AhbCopyDecoderInto(decoderId, rec.commandBuffer, dstImg.image,
-                static_cast<unsigned int>(trackData->width), static_cast<unsigned int>(trackData->height));
+            unity::webrtc::AhbConvertDecoderInto(
+                decoderId, rec.commandBuffer, dstImg.image, rec.currentFrameNumber, rec.safeFrameNumber);
 
             // Back to shader-read for sampling/display.
             s_unityVulkan->AccessTexture(trackData->texture, &subres, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -463,31 +452,6 @@ extern "C" UnityRenderingEventAndData UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 }
 
 #if UNITY_ANDROID && defined(SUPPORT_VULKAN)
-// Per-frame render-thread event for the zero-copy H.264 convert. Grabs Unity's current
-// command buffer (CommandRecordingState), then has every live AHB decoder reclaim
-// completed inputs and record any pending YUV->RGBA convert into it. Unity submits the
-// command buffer with its own frame — we never submit ourselves.
-static void UNITY_INTERFACE_API OnAhbConvertEvent(int /*eventID*/)
-{
-    if (!s_unityVulkan)
-        return;
-    UnityVulkanRecordingState state = {};
-    if (!s_unityVulkan->CommandRecordingState(&state, kUnityVulkanGraphicsQueueAccess_DontCare))
-        return;
-    unity::webrtc::AhbDrainAllDecoders(
-        state.commandBuffer, state.currentFrameNumber, state.safeFrameNumber);
-}
-
-extern "C" UnityRenderingEvent UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetAhbConvertEventFunc()
-{
-    return OnAhbConvertEvent;
-}
-
-extern "C" int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetAhbConvertEventID()
-{
-    return s_ahbConvertEventID;
-}
-
 // Lets C# decide the receive-texture type + customTextureUpload to match the native AHB
 // mode (debug.ahb.mode): >=2 => zero-copy display (RenderTexture + GPU copy).
 extern "C" int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetAhbDisplayMode()
@@ -496,5 +460,11 @@ extern "C" int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetAhbDisplayMode()
     if (__system_property_get("debug.ahb.mode", buf) > 0)
         return atoi(buf);
     return 3;
+}
+
+// C# visibility hook: pause/resume the zero-copy decode for the board on `rendererId`.
+extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API AhbStreamSetVisible(unsigned int rendererId, int visible)
+{
+    unity::webrtc::AhbSetStreamVisible(rendererId, visible);
 }
 #endif

@@ -12,18 +12,21 @@ namespace webrtc
 {
     const UnityVulkanInstance* GetUnityVulkanInstance();
 
-    // Render-thread drain: for every live AHB decoder, reclaim inputs whose recorded frame
-    // has completed (safeFrame) and record any pending convert into Unity's command buffer
-    // `cmd` (tagged with curFrame). Called once per frame from the AHB convert plugin event
-    // (UnityRenderEvent.cpp), which holds Unity's current command buffer. `cmd` is a
-    // VkCommandBuffer passed as void* to keep this header free of Vulkan platform headers.
-    // Implemented in AhbH264DecoderFactory.cpp.
-    void AhbDrainAllDecoders(void* cmd, unsigned long long curFrame, unsigned long long safeFrame);
-
-    // Render-thread copy: copy decoder `id`'s latest converted RGBA image into Unity's
-    // receive texture image `dstImage` (a VkImage as void*, already in TRANSFER_DST).
-    // Returns false if the decoder is gone or has no converted frame yet. Implemented in
+    // Render-thread convert: for decoder `id`, reclaim completed inputs (safeFrame) and
+    // convert its latest pending frame DIRECTLY into Unity's receive texture image
+    // `dstImage` (a VkImage as void*, already transitioned to GENERAL), recorded into
+    // Unity's command buffer `cmd` and tagged with `curFrame`. Returns false if the decoder
+    // is gone. void* params keep this header free of Vulkan platform headers. Implemented in
     // AhbH264DecoderFactory.cpp.
-    bool AhbCopyDecoderInto(unsigned long long id, void* cmd, void* dstImage, unsigned int w, unsigned int h);
+    bool AhbConvertDecoderInto(
+        unsigned long long id, void* cmd, void* dstImage, unsigned long long curFrame, unsigned long long safeFrame);
+
+    // Render thread: record which decoder (by id from the kNative frame) feeds rendererId,
+    // so C# can pause that decoder by rendererId on visibility changes.
+    void AhbMapRenderer(unsigned int rendererId, unsigned long long decoderId);
+
+    // C# visibility hook: pause (visible==0) / resume the decode for the stream shown on
+    // rendererId. Paused = the decoder stops feeding MediaCodec (idle HW decoder).
+    void AhbSetStreamVisible(unsigned int rendererId, int visible);
 }
 } // namespace unity
