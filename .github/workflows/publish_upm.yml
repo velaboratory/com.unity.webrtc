@@ -1,0 +1,20 @@
+name: Publish to Verdaccio
+on:
+  push:
+    branches: ["main"]   # adjust to whatever branch you cut releases from
+    paths: ["**"]
+jobs:
+  publish-npm:
+    name: publish to npm.ugavel.com
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 16
+          registry-url: http://npm.ugavel.com/
+      - name: actually publish
+        run: |
+          npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.VERDACCIO_TOKEN}}

@@ -137,6 +137,12 @@ namespace Unity.WebRTC
         public bool Decoding => m_renderer != null;
 
         /// <summary>
+        ///     Native renderer id for this receive track (0 if not decoding). Used to pause
+        ///     the zero-copy AHB decode for this stream when its board is off-screen.
+        /// </summary>
+        public uint RendererId => m_renderer != null ? m_renderer.id : 0;
+
+        /// <summary>
         ///     Indicates that the track is configured to encode and send a video stream to a remote peer.
         /// </summary>
         public bool Encoding => m_source != null;
@@ -485,7 +491,26 @@ namespace Unity.WebRTC
             }
 
             var format = WebRTC.GetSupportedGraphicsFormat(SystemInfo.graphicsDeviceType);
-            Texture = new Texture2D(width, height, format, TextureCreationFlags.None);
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (NativeMethods.GetAhbDisplayMode() >= 2)
+            {
+                // Zero-copy receive: a RenderTexture with random-write (UAV/storage) so the
+                // native AHB convert compute pass writes the decoded RGBA straight into it
+                // (one GPU pass, no intermediate copy). Forced R8G8B8A8_UNorm so the native
+                // storage-image view format matches exactly (storage can't reinterpret BGRA).
+                var rt = new RenderTexture(
+                    width, height, 0, UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_UNorm);
+                rt.enableRandomWrite = true;
+                rt.Create();
+                Texture = rt;
+                customTextureUpload = true;
+            }
+            else
+#endif
+            {
+                Texture = new Texture2D(width, height, format, TextureCreationFlags.None);
+                customTextureUpload = false;
+            }
             TexturePtr = Texture.GetNativeTexturePtr();
             track.OnVideoFrameResize(Texture);
         }
