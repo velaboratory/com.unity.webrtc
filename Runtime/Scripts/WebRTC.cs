@@ -1715,6 +1715,12 @@ namespace Unity.WebRTC
         public static extern IntPtr GetBatchUpdateEventFunc(IntPtr context);
         [DllImport(WebRTC.Lib)]
         public static extern int GetBatchUpdateEventID();
+#if UNITY_ANDROID && !UNITY_EDITOR
+        // >=2 => zero-copy display: receive RenderTexture (UAV) the native convert writes
+        // into. Android-only — exported only by our custom arm64 libwebrtc.so.
+        [DllImport(WebRTC.Lib)]
+        public static extern int GetAhbDisplayMode();
+#endif
         [DllImport(WebRTC.Lib)]
         public static extern IntPtr GetUpdateTextureFunc(IntPtr context);
         [DllImport(WebRTC.Lib)]
