@@ -4,6 +4,24 @@ All notable changes to the webrtc package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [3.0.4] - 2026-06-21 (VEL fork)
+
+### Added
+
+- **AHB zero-copy native plugin source** ported onto `main`
+  (`Plugin~/WebRTCPlugin/Codec/AhbCodec/*`, the `GetAhbDisplayMode` / Vulkan / renderer hooks, and
+  `BuildScripts~/build_ahb_plugin.sh`). 3.0.3 shipped the custom `libwebrtc.aar` without the source
+  that built it (the source lived only on the `ahb-zerocopy-h264` branch); the binary is now
+  reproducible from this branch. **Verified:** a fresh arm64 / API-26 build reproduces the shipped
+  `.so` (same AHB symbols, byte size within ~350 bytes).
+
+### Notes
+
+- **Runtime-identical to 3.0.3 / 3.0.2** — the added `Plugin~/` source is build-time only (Unity
+  ignores `~` folders); the prebuilt `.aar` and all `Runtime/Scripts` are unchanged.
+- (VEL-fork history: 3.0.0–3.0.2 were manual publishes with drifted source; 3.0.3 was the first
+  proper git publish but lacked the native source; 3.0.4 reconciles it.)
+
 ## [3.0.0] - 2025-09-12
 
 ### Changed

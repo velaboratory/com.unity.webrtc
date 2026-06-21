@@ -7,3 +7,7 @@ target_sources(
 if(Windows OR Linux)
   add_subdirectory(NvCodec)
 endif()
+
+if(Android)
+  add_subdirectory(AhbCodec)
+endif()

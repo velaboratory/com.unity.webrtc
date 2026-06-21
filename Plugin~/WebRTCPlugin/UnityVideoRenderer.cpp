@@ -4,6 +4,11 @@
 
 #include "UnityVideoRenderer.h"
 
+#if UNITY_ANDROID
+#include "Codec/AhbCodec/AhbDisplayBuffer.h"
+#include "Codec/AhbCodec/AhbVulkanContext.h"
+#endif
+
 namespace unity
 {
 namespace webrtc
@@ -33,7 +38,19 @@ namespace webrtc
 
         if (frame_buffer->type() == webrtc::VideoFrameBuffer::Type::kNative)
         {
+#if UNITY_ANDROID
+            // Our AhbDisplayBuffer carrying the decoder id; keep it so the batch Decode
+            // branch converts the decoder's zero-copy frame into the texture. Record which
+            // decoder feeds this renderer (once) so C# can pause it by rendererId.
+            uint64_t decoderId = static_cast<AhbDisplayBuffer*>(frame_buffer.get())->DecoderId();
+            if (decoderId != m_lastMappedDecoder)
+            {
+                AhbMapRenderer(m_id, decoderId);
+                m_lastMappedDecoder = decoderId;
+            }
+#else
             frame_buffer = frame_buffer->ToI420();
+#endif
         }
         SetFrameBuffer(frame_buffer, frame.timestamp_us());
     }

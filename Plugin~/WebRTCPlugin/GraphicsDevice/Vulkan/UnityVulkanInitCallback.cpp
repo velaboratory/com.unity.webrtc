@@ -1,5 +1,7 @@
 #include "pch.h"
 
+#include <cstring>
+
 #include "UnityVulkanInitCallback.h"
 
 namespace unity
@@ -20,6 +22,18 @@ namespace webrtc
 #elif UNITY_WIN
                                                                   VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
                                                                   VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME
+#elif UNITY_ANDROID
+                                                                  // Enable AHardwareBuffer import so our zero-copy
+                                                                  // H.264 decoder can wrap MediaCodec output as a
+                                                                  // sampled VkImage (string literals avoid the
+                                                                  // vulkan_android.h dependency here).
+                                                                  "VK_ANDROID_external_memory_android_hardware_buffer",
+                                                                  "VK_KHR_dedicated_allocation",
+                                                                  "VK_KHR_get_memory_requirements2",
+                                                                  "VK_KHR_bind_memory2",
+                                                                  "VK_EXT_queue_family_foreign",
+                                                                  "VK_KHR_maintenance1",
+                                                                  "VK_KHR_sampler_ycbcr_conversion"
 #endif
     };
 
@@ -48,6 +62,26 @@ namespace webrtc
             enabledExtensions.begin(),
             enabledExtensions.end(),
             std::inserter(newExtensions, std::end(newExtensions)));
+
+        // set_union above compares const char* by POINTER, so the same extension from
+        // both lists (different string literals) survives as a duplicate. Dedup by
+        // string so vkCreateDevice never gets a repeated name (some drivers reject it).
+        {
+            std::vector<const char*> deduped;
+            for (const char* ext : newExtensions)
+            {
+                bool seen = false;
+                for (const char* kept : deduped)
+                    if (std::strcmp(ext, kept) == 0)
+                    {
+                        seen = true;
+                        break;
+                    }
+                if (!seen)
+                    deduped.push_back(ext);
+            }
+            newExtensions.swap(deduped);
+        }
 
         RTC_LOG(LS_INFO) << "WebRTC plugin intercepts vkCreateDevice.";
 
