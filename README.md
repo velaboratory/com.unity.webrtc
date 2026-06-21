@@ -1,5 +1,11 @@
 # WebRTC for Unity
 
+> **⚠️ This is velaboratory's fork** of Unity's `com.unity.webrtc`, published to `npm.ugavel.com` as
+> `com.unity.webrtc`. The canonical branch is **`main`** (currently **3.0.3**); it adds a spatial-audio
+> receiver and a custom Android AHB libwebrtc, and auto-publishes on push to `main`. The many `origin/*`
+> branches are **upstream Unity's** and the `ahb-zerocopy-h264` branch is a separate WIP — see
+> **[CLAUDE.md](CLAUDE.md)** before touching this, or the branches/versions will mislead you.
+
 <img src="https://img.shields.io/badge/unity-6000.3-green.svg?style=flat-square" alt="unity 6000.3">
 
 **WebRTC for Unity** is a package that allows [WebRTC](https://webrtc.org) to be used in Unity.

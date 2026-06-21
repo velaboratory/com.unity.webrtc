@@ -13,8 +13,16 @@ jobs:
         with:
           node-version: 16
           registry-url: http://npm.ugavel.com/
-      - name: actually publish
+      - name: publish if the version is new
+        # Publish only when package.json's version isn't already on the registry, so docs /
+        # maintenance pushes to main don't fail (npm refuses to overwrite) or spuriously republish.
         run: |
-          npm publish
+          VER=$(node -p "require('./package.json').version")
+          if npm view "com.unity.webrtc@$VER" version >/dev/null 2>&1; then
+            echo "com.unity.webrtc@$VER is already on npm.ugavel.com — skipping publish."
+          else
+            echo "Publishing com.unity.webrtc@$VER"
+            npm publish
+          fi
         env:
           NODE_AUTH_TOKEN: ${{secrets.VERDACCIO_TOKEN}}
