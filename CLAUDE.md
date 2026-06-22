@@ -66,7 +66,7 @@ so the binary is now reproducible from its own branch. 3.0.4 is **runtime-identi
 | Thing | What it is | Do |
 |---|---|---|
 | **`main` (3.0.4)** | Canonical, published, **self-contained**: AHB native source + prebuilt `.aar` + spatial audio + CI. | **Start here. Cut releases from here.** |
-| **`ahb-zerocopy-h264` (3.0.0 base)** | An older experimental branch. Its **native AHB source is now on `main`** (3.0.4). What's still unique to it: experimental **receive-decoder C# wiring** (`VideoStreamTrack` changes) — and it **dropped `SpatialAudioReceiver`**. Its committed `.aar` is stale stock (no AHB symbols). | Mine it only for the unmerged receive-decoder C# (WIP, needs device testing). **Don't** cut releases or build the `.aar` from it. |
+| **`ahb-zerocopy-h264` (3.0.0 base)** | The older branch that pioneered the AHB decoder. Its two commits touched **only native C++ + build scripts — zero C# files** (the "zero-copy receive decoder": MediaCodec → AHB → Vulkan compute → texture, + direct-write / off-screen-decode-pause refinements). **All of that native source is now on `main`** (3.0.4), verified byte-identical (the `main`↔branch diff shows no `Plugin~` changes). So nothing is stranded on it; it only *lacks* what `main` adds (the C# bindings, `SpatialAudioReceiver`, the working `.aar`, the CI). Its committed `.aar` is stale stock (no AHB symbols — strictly worse). | **Superseded by `main` — archive/ignore.** Don't release or build from it. |
 | `origin/*` (100+ branches) | Upstream Unity-Technologies branches. | Ignore. |
 | Sibling dir `com.unity.webrtc-3.0.1/` (not a git repo, version 3.0.2) | A manual-publish-era loose export. | Ignore — not source. |
 
