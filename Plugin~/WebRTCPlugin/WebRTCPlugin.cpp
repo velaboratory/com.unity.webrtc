@@ -421,6 +421,13 @@ extern "C"
     // of dereferencing a null sink and crashing UnityMain.
     UNITY_INTERFACE_EXPORT uint32_t GetVideoRendererId(UnityVideoRenderer* sink) { return sink ? sink->GetId() : 0; }
 
+    // 1 if this renderer's decoder delivers zero-copy AHB (kNative) frames, 0 if software/I420, -1 if
+    // unknown. C# uses it to pick the zero-copy RenderTexture vs the standard Texture2D upload per track.
+    UNITY_INTERFACE_EXPORT int GetRendererFrameIsNative(UnityVideoRenderer* sink)
+    {
+        return sink ? (sink->LastFrameWasNative() ? 1 : 0) : -1;
+    }
+
     UNITY_INTERFACE_EXPORT void DeleteVideoRenderer(Context* context, UnityVideoRenderer* sink)
     {
         context->DeleteVideoRenderer(sink);

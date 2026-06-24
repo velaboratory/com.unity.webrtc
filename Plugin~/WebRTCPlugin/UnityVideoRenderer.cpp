@@ -36,6 +36,11 @@ namespace webrtc
     {
         rtc::scoped_refptr<webrtc::VideoFrameBuffer> frame_buffer = frame.video_frame_buffer();
 
+        // Record whether this decoder delivers zero-copy AHB (kNative) frames. Software decoders
+        // (libvpx VP8) deliver I420; C# reads this to choose the standard Texture2D upload for them.
+        m_lastFrameNative.store(
+            frame_buffer->type() == webrtc::VideoFrameBuffer::Type::kNative, std::memory_order_relaxed);
+
         if (frame_buffer->type() == webrtc::VideoFrameBuffer::Type::kNative)
         {
 #if UNITY_ANDROID

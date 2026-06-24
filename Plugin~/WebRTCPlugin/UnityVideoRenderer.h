@@ -26,6 +26,11 @@ namespace webrtc
         rtc::scoped_refptr<VideoFrameBuffer> GetFrameBuffer();
         void SetFrameBuffer(rtc::scoped_refptr<VideoFrameBuffer> buffer, int64_t timestamp);
 
+        // Whether the most recent decoded frame was a kNative (zero-copy AHB) buffer. Lets C# pick the
+        // zero-copy RenderTexture display for HW/AHB decoders vs the standard Texture2D upload for
+        // software decoders (libvpx VP8) whose I420 frames the AHB compute display can't consume.
+        bool LastFrameWasNative() const { return m_lastFrameNative.load(std::memory_order_relaxed); }
+
         // used in UnityRenderingExtEventUpdateTexture
         // called on RenderThread
         void* ConvertVideoFrameToTextureAndWriteToBuffer(int width, int height, libyuv::FourCC format);
@@ -39,6 +44,7 @@ namespace webrtc
         std::atomic<int64_t> m_timestamp;
         DelegateVideoFrameResize m_callback;
         bool m_needFlipVertical;
+        std::atomic<bool> m_lastFrameNative{ false }; // set in OnFrame; read lock-free by C# at resize
 #if UNITY_ANDROID
         uint64_t m_lastMappedDecoder = 0; // AHB decoder->renderer map recorded once per stream
 #endif

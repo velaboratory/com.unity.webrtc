@@ -70,6 +70,17 @@ namespace webrtc
         return true;
     }
 
+    namespace
+    {
+        // The VK_KHR_sampler_ycbcr_conversion multi-planar / 422 formats occupy this contiguous range.
+        // An AHB that reports one of them (e.g. a software MediaCodec's NV12 output) needs a ycbcr
+        // conversion just like an external-format vendor AHB — it is NOT plain RGBA.
+        inline bool IsYcbcrVkFormat(VkFormat f)
+        {
+            return f >= VK_FORMAT_G8B8G8R8_422_UNORM && f <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM;
+        }
+    } // namespace
+
     bool AhbVkImporter::EnsureConversion(AHardwareBuffer* ahb)
     {
         if (m_conversionReady)
@@ -80,10 +91,15 @@ namespace webrtc
         if (!QueryFormat(m_getAhbProps, m_device, ahb, &fmtProps, &ahbProps))
             return false;
 
-        m_isYcbcr = (fmtProps.format == VK_FORMAT_UNDEFINED);
+        // Hardware decoders report a vendor (external) format -> format == VK_FORMAT_UNDEFINED. The
+        // software c2.android.* decoders report a KNOWN multi-planar YUV VkFormat (e.g. NV12). BOTH need
+        // a ycbcr conversion; only a true RGBA AHB does not. Treating a known-YUV format as RGBA samples
+        // the YUV planes as colour -> green.
+        const bool externalFmt = (fmtProps.format == VK_FORMAT_UNDEFINED);
+        m_isYcbcr = externalFmt || IsYcbcrVkFormat(fmtProps.format);
         if (!m_isYcbcr)
         {
-            // RGBA8 AHB — Unity samples it directly, no conversion needed.
+            // Plain RGBA AHB — Unity samples it directly, no conversion needed.
             m_conversionReady = true;
             return true;
         }
@@ -105,8 +121,8 @@ namespace webrtc
 
         VkSamplerYcbcrConversionCreateInfo cci = {};
         cci.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
-        cci.pNext = &extFmt;
-        cci.format = VK_FORMAT_UNDEFINED;
+        cci.pNext = externalFmt ? &extFmt : nullptr;
+        cci.format = externalFmt ? VK_FORMAT_UNDEFINED : fmtProps.format;
         cci.ycbcrModel = fmtProps.suggestedYcbcrModel;
         cci.ycbcrRange = fmtProps.suggestedYcbcrRange;
         cci.components = fmtProps.samplerYcbcrConversionComponents;
@@ -216,7 +232,8 @@ namespace webrtc
         if (!QueryFormat(m_getAhbProps, m_device, ahb, &fmtProps, &ahbProps))
             return false;
 
-        const bool isYcbcr = (fmtProps.format == VK_FORMAT_UNDEFINED);
+        const bool externalFmt = (fmtProps.format == VK_FORMAT_UNDEFINED);
+        const bool isYcbcr = externalFmt || IsYcbcrVkFormat(fmtProps.format);
 
         AhbFrameImage result = {};
         result.isYcbcr = isYcbcr;
@@ -229,14 +246,14 @@ namespace webrtc
 
         VkExternalMemoryImageCreateInfo extImg = {};
         extImg.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-        extImg.pNext = isYcbcr ? &extFmt : nullptr;
+        extImg.pNext = externalFmt ? &extFmt : nullptr;
         extImg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 
         VkImageCreateInfo ici = {};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.pNext = &extImg;
         ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = isYcbcr ? VK_FORMAT_UNDEFINED : VK_FORMAT_R8G8B8A8_UNORM;
+        ici.format = externalFmt ? VK_FORMAT_UNDEFINED : (isYcbcr ? fmtProps.format : VK_FORMAT_R8G8B8A8_UNORM);
         ici.extent = { width, height, 1 };
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
@@ -268,7 +285,7 @@ namespace webrtc
             vci.pNext = &convInfo;
             vci.image = result.image;
             vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = VK_FORMAT_UNDEFINED;
+            vci.format = externalFmt ? VK_FORMAT_UNDEFINED : fmtProps.format;
             vci.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                 VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
             vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };

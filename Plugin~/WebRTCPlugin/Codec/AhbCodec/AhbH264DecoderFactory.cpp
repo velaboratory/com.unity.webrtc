@@ -84,8 +84,9 @@ namespace webrtc
         class AhbH264Decoder : public ::webrtc::VideoDecoder
         {
         public:
-            explicit AhbH264Decoder(std::unique_ptr<::webrtc::VideoDecoder> inner)
+            AhbH264Decoder(std::unique_ptr<::webrtc::VideoDecoder> inner, std::string mime)
                 : inner_(std::move(inner))
+                , mime_(std::move(mime))
                 , mode_(ReadAhbMode())
             {
             }
@@ -248,20 +249,23 @@ namespace webrtc
 
                 int w = static_cast<int>(input._encodedWidth);
                 int h = static_cast<int>(input._encodedHeight);
-                if (w <= 0 || h <= 0)
+                const bool haveInputRes = (w > 0 && h > 0);
+                if (!haveInputRes)
                 {
-                    w = cfgW_;
-                    h = cfgH_;
+                    // Some receive paths (notably AV1, H265) never populate _encodedWidth/Height. Seed
+                    // the decoder with the last-known or a default size; the MediaCodec then reports the
+                    // true size via INFO_OUTPUT_FORMAT_CHANGED and resizes its AImageReader to match
+                    // (we read codec_.Width()/Height() for the imported frame below).
+                    w = cfgW_ > 0 ? cfgW_ : 1280;
+                    h = cfgH_ > 0 ? cfgH_ : 720;
                 }
-                if (w <= 0 || h <= 0)
-                    return; // no resolution yet (waiting for a keyframe)
 
-                if (!codec_.IsStarted() || w != cfgW_ || h != cfgH_)
+                if (!codec_.IsStarted() || (haveInputRes && (w != cfgW_ || h != cfgH_)))
                 {
                     codec_.Release();
-                    if (!codec_.Configure(w, h))
+                    if (!codec_.Configure(w, h, mime_.c_str()))
                     {
-                        AHB_LOG("AhbMediaCodec.Configure(%dx%d) failed", w, h);
+                        AHB_LOG("AhbMediaCodec.Configure(%s %dx%d) failed", mime_.c_str(), w, h);
                         return;
                     }
                     cfgW_ = w;
@@ -276,13 +280,23 @@ namespace webrtc
                 if (!ahb)
                     return; // decoder warming up / no new frame this tick
 
+                // Frame dimensions: the input's exact encoded size when present (no codec padding);
+                // otherwise (AV1/H265) the MediaCodec's reported size, learned on format change.
+                int dw = haveInputRes ? w : codec_.Width();
+                int dh = haveInputRes ? h : codec_.Height();
+                if (dw <= 0 || dh <= 0)
+                {
+                    dw = w;
+                    dh = h;
+                }
+
                 if (!importer_.EnsureConversion(ahb))
                 {
                     AhbMediaCodec::ReleaseImage(img);
                     return;
                 }
                 AhbFrameImage fi;
-                if (!importer_.ImportImage(ahb, static_cast<uint32_t>(w), static_cast<uint32_t>(h), &fi))
+                if (!importer_.ImportImage(ahb, static_cast<uint32_t>(dw), static_cast<uint32_t>(dh), &fi))
                 {
                     AhbMediaCodec::ReleaseImage(img);
                     return;
@@ -307,7 +321,7 @@ namespace webrtc
                 // converted image; the rtp timestamp advances so each frame is shown.
                 if (realCallback_)
                 {
-                    auto buf = rtc::make_ref_counted<AhbDisplayBuffer>(reinterpret_cast<uint64_t>(this), w, h);
+                    auto buf = rtc::make_ref_counted<AhbDisplayBuffer>(reinterpret_cast<uint64_t>(this), dw, dh);
                     ::webrtc::VideoFrame frame = ::webrtc::VideoFrame::Builder()
                                                      .set_video_frame_buffer(buf)
                                                      .set_timestamp_rtp(input.Timestamp())
@@ -338,6 +352,7 @@ namespace webrtc
             }
 
             std::unique_ptr<::webrtc::VideoDecoder> inner_; // delegate, only used in mode<2
+            std::string mime_;                              // AMediaCodec mime for this codec (video/avc, video/x-vnd.on2.vp9, ...)
             ::webrtc::DecodedImageCallback* realCallback_ = nullptr;
             AhbMediaCodec codec_;
             AhbVkImporter importer_;
@@ -373,29 +388,51 @@ namespace webrtc
 
             std::vector<::webrtc::SdpVideoFormat> GetSupportedFormats() const override
             {
-                std::vector<::webrtc::SdpVideoFormat> out;
-                if (!android_)
-                    return out;
-                for (const auto& format : android_->GetSupportedFormats())
-                {
-                    if (format.name == "H264")
-                        out.push_back(format);
-                }
-                return out;
+                // Advertise exactly what the platform HW decoder factory supports (H264, VP9, AV1). We do
+                // NOT add VP8: the Quest has no HW VP8 decoder, and routing it through our AHB MediaCodec
+                // produces a broken chroma plane (green). VP8 is left to libwebrtc's internal libvpx decoder
+                // (kInternalImpl) + the standard (non-zero-copy) Texture2D upload — its I420 output can't go
+                // through the AHB zero-copy compute display anyway. The per-track display switch (a Texture2D
+                // when the decoder isn't delivering native AHB frames) is what makes that work. (H265 is also
+                // absent: this libwebrtc build has no HEVC codec support at all.)
+                return android_ ? android_->GetSupportedFormats() : std::vector<::webrtc::SdpVideoFormat>();
             }
 
             std::unique_ptr<::webrtc::VideoDecoder>
             CreateVideoDecoder(const ::webrtc::SdpVideoFormat& format) override
             {
-                AHB_LOG("CreateVideoDecoder(%s) -> AhbH264", format.name.c_str());
                 if (!android_)
                     return nullptr;
-                // The inner decoder is created but only configured/used as the mode<2
-                // fallback; in the native path the decoder drops it (no extra session).
-                return std::make_unique<AhbH264Decoder>(android_->CreateVideoDecoder(format));
+                // Drive the zero-copy AHB pipeline (MediaCodec -> AImageReader -> Vulkan compute) for any
+                // codec we can map to a MediaCodec mime. The AHB output path is codec-agnostic, so VP8/VP9/
+                // HEVC/AV1 zero-copy exactly like H.264 — and, crucially, they produce the kNative
+                // AhbDisplayBuffer the receive-display path needs. A stock-decoder I420 frame would be
+                // skipped by the zero-copy display branch and render TRANSPARENT (the VP9 bug).
+                const char* mime = MimeForCodec(format.name);
+                if (mime)
+                {
+                    AHB_LOG("CreateVideoDecoder(%s) -> AHB zero-copy (mime=%s)", format.name.c_str(), mime);
+                    return std::make_unique<AhbH264Decoder>(android_->CreateVideoDecoder(format), mime);
+                }
+                // No AHB mime for this codec — hand it to the stock platform decoder (won't zero-copy
+                // display, but better than nothing for an unforeseen codec).
+                AHB_LOG("CreateVideoDecoder(%s) -> stock platform decoder (no AHB mime)", format.name.c_str());
+                return android_->CreateVideoDecoder(format);
             }
 
         private:
+            // SDP codec name -> Android MediaCodec mime for the codecs we drive through the zero-copy AHB
+            // pipeline, or nullptr otherwise. Only the codecs the wrapped HW factory advertises reach here
+            // (GetSupportedFormats), so each mapped mime is one the device's MediaCodec actually supports.
+            // VP8 is intentionally absent: no HW VP8 on Quest, so it stays on libvpx + the standard upload.
+            static const char* MimeForCodec(const std::string& name)
+            {
+                if (name == "H264") return "video/avc";
+                if (name == "VP9")  return "video/x-vnd.on2.vp9";
+                if (name == "AV1")  return "video/av01";
+                return nullptr;
+            }
+
             std::unique_ptr<::webrtc::VideoDecoderFactory> android_;
         };
 

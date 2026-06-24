@@ -4,6 +4,31 @@ All notable changes to the webrtc package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [3.0.6] - 2026-06-24 (VEL fork)
+
+### Added
+
+- **Multi-codec AHB zero-copy decode (VP9, AV1).** The zero-copy AHB path was H.264-only; it now drives
+  the correct MediaCodec mime per codec (`video/avc`, `video/x-vnd.on2.vp9`, `video/av01`), so VP9 and AV1
+  hardware-decode zero-copy on Quest just like H.264. (H.265 is unavailable — this libwebrtc build has no
+  HEVC codec support — and VP8 has no Quest HW decoder, so it stays on libvpx; see below.)
+- **Per-track display path.** Each `UnityVideoRenderer` records whether its decoder delivers native (AHB)
+  frames (`LastFrameWasNative` / the `GetRendererFrameIsNative` export). C# now picks the zero-copy
+  random-write `RenderTexture` only for those, and the standard `Texture2D` CPU upload for software decoders
+  (e.g. libvpx VP8) whose I420 output the AHB compute display can't consume. Previously the display mode
+  was global, so a software-decoded stream rendered nothing under the AHB path.
+
+### Fixed
+
+- **Decoder-driven resolution for codecs without `_encodedWidth`.** AV1's receive path never populates
+  `_encodedWidth/Height`, so the AHB decoder couldn't size its `AImageReader` and produced no frames. It
+  now seeds a size, learns the true dimensions from MediaCodec's `INFO_OUTPUT_FORMAT_CHANGED`, and resizes
+  the reader in place via `AMediaCodec_setOutputSurface`.
+- **Green video from known multi-planar AHB formats.** `AhbVkImporter` classified any non-`UNDEFINED`
+  format as RGBA8 (no conversion). A known multi-planar YUV `VkFormat` (e.g. NV12) is now recognized and
+  given the proper `VkSamplerYcbcrConversion` (using `fmtProps.format`, not the external-format path),
+  instead of sampling the YUV planes as colour (green).
+
 ## [3.0.5] - 2026-06-24 (VEL fork)
 
 ### Fixed

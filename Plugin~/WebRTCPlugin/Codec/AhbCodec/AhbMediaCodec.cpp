@@ -21,37 +21,54 @@ namespace webrtc
 {
     AhbMediaCodec::~AhbMediaCodec() { Release(); }
 
-    bool AhbMediaCodec::Configure(int width, int height)
+    namespace
+    {
+        // Create an AImageReader (GPU-sampled AHBs the decoder renders into, zero copy) + its window.
+        // maxImages 8 covers the convert ring (4) + the stashed pending frame + an acquire transient.
+        bool MakeReader(int width, int height, AImageReader** outReader, ANativeWindow** outWindow)
+        {
+            *outReader = nullptr;
+            *outWindow = nullptr;
+            AImageReader* reader = nullptr;
+            media_status_t st = AImageReader_newWithUsage(
+                width, height, AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 8, &reader);
+            if (st != AMEDIA_OK || !reader)
+            {
+                AHB_LOG("AImageReader_newWithUsage(%dx%d) failed (%d)", width, height, static_cast<int>(st));
+                return false;
+            }
+            ANativeWindow* window = nullptr;
+            if (AImageReader_getWindow(reader, &window) != AMEDIA_OK || !window)
+            {
+                AHB_LOG("AImageReader_getWindow failed");
+                AImageReader_delete(reader);
+                return false;
+            }
+            *outReader = reader;
+            *outWindow = window;
+            return true;
+        }
+    } // namespace
+
+    bool AhbMediaCodec::Configure(int width, int height, const char* mime)
     {
         m_width = width;
         m_height = height;
+        if (!mime || !mime[0])
+            mime = "video/avc";
 
-        // AImageReader produces GPU-sampled AHBs the decoder renders into (zero copy).
-        // maxImages must cover the convert ring (kRing) + the stashed pending frame + an
-        // acquire transient, while still leaving the producer (MediaCodec) buffers to
-        // render into — 8 gives headroom over the ring depth of 4.
-        media_status_t st = AImageReader_newWithUsage(
-            width, height, AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 8, &m_reader);
-        if (st != AMEDIA_OK || !m_reader)
-        {
-            AHB_LOG("AImageReader_newWithUsage failed (%d)", static_cast<int>(st));
+        if (!MakeReader(width, height, &m_reader, &m_window))
             return false;
-        }
-        if (AImageReader_getWindow(m_reader, &m_window) != AMEDIA_OK || !m_window)
-        {
-            AHB_LOG("AImageReader_getWindow failed");
-            return false;
-        }
 
-        m_codec = AMediaCodec_createDecoderByType("video/avc");
+        m_codec = AMediaCodec_createDecoderByType(mime);
         if (!m_codec)
         {
-            AHB_LOG("AMediaCodec_createDecoderByType(video/avc) failed");
+            AHB_LOG("AMediaCodec_createDecoderByType(%s) failed", mime);
             return false;
         }
 
         AMediaFormat* fmt = AMediaFormat_new();
-        AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, "video/avc");
+        AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, mime);
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, width);
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, height);
         AMediaFormat_setInt32(fmt, "low-latency", 1);
@@ -68,7 +85,7 @@ namespace webrtc
             return false;
         }
         m_started = true;
-        AHB_LOG("AhbMediaCodec up: %dx%d (NDK AMediaCodec -> AImageReader)", width, height);
+        AHB_LOG("AhbMediaCodec up: %s %dx%d (NDK AMediaCodec -> AImageReader)", mime, width, height);
         return true;
     }
 
@@ -109,8 +126,54 @@ namespace webrtc
                 // render = true -> the frame is composited into the AImageReader's AHB.
                 AMediaCodec_releaseOutputBuffer(m_codec, static_cast<size_t>(outIdx), true);
             }
-            else if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED ||
-                     outIdx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED)
+            else if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED)
+            {
+                // The decoder now reports the true frame size. For codecs whose WebRTC receive path
+                // doesn't set _encodedWidth (AV1, H265) we configured with a seed, so resize the
+                // AImageReader to the real display dimensions by swapping the codec's output surface
+                // (AMediaCodec_setOutputSurface keeps decode state — no reconfigure, no lost frame).
+                AMediaFormat* fmt = AMediaCodec_getOutputFormat(m_codec);
+                if (fmt)
+                {
+                    int32_t rw = 0, rh = 0;
+                    AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &rw);
+                    AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, &rh);
+                    int32_t cl = 0, cr = 0, ct = 0, cb = 0; // prefer the crop (visible) rect when present
+                    if (AMediaFormat_getInt32(fmt, "crop-left", &cl) && AMediaFormat_getInt32(fmt, "crop-right", &cr) &&
+                        AMediaFormat_getInt32(fmt, "crop-top", &ct) && AMediaFormat_getInt32(fmt, "crop-bottom", &cb) &&
+                        cr > cl && cb > ct)
+                    {
+                        rw = cr - cl + 1;
+                        rh = cb - ct + 1;
+                    }
+                    AMediaFormat_delete(fmt);
+                    if (rw > 0 && rh > 0 && (rw != m_width || rh != m_height))
+                    {
+                        AImageReader* newReader = nullptr;
+                        ANativeWindow* newWindow = nullptr;
+                        if (MakeReader(rw, rh, &newReader, &newWindow))
+                        {
+                            if (AMediaCodec_setOutputSurface(m_codec, newWindow) == AMEDIA_OK)
+                            {
+                                if (m_reader)
+                                    AImageReader_delete(m_reader); // codec now renders into newReader
+                                m_reader = newReader;
+                                m_window = newWindow;
+                                m_width = rw;
+                                m_height = rh;
+                                AHB_LOG("output format -> %dx%d (AImageReader resized)", rw, rh);
+                            }
+                            else
+                            {
+                                AImageReader_delete(newReader);
+                                AHB_LOG("AMediaCodec_setOutputSurface(%dx%d) failed", rw, rh);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            else if (outIdx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED)
             {
                 continue;
             }

@@ -16,9 +16,12 @@ namespace unity
 {
 namespace webrtc
 {
-    // NDK H.264 decoder (AMediaCodec) that renders decoded frames straight into
+    // NDK video decoder (AMediaCodec) that renders decoded frames straight into
     // AHardwareBuffer-backed images via an AImageReader — fully native (no Java, no
     // GL/EGL). The AHBs are then imported as VkImages (AhbVkImporter) for zero-copy.
+    // Codec-agnostic: the `mime` passed to Configure selects the underlying MediaCodec
+    // (video/avc, video/x-vnd.on2.vp9, video/hevc, video/av01, ...); the AHB output path
+    // is identical for all of them.
     class AhbMediaCodec
     {
     public:
@@ -27,9 +30,10 @@ namespace webrtc
         AhbMediaCodec(const AhbMediaCodec&) = delete;
         AhbMediaCodec& operator=(const AhbMediaCodec&) = delete;
 
-        bool Configure(int width, int height);
+        // `mime` is an Android MediaCodec mime type, e.g. "video/avc" / "video/x-vnd.on2.vp9".
+        bool Configure(int width, int height, const char* mime);
 
-        // Queue one Annex-B access unit and pump decoder output to the AImageReader.
+        // Queue one access unit / compressed frame and pump decoder output to the AImageReader.
         bool DecodeNal(const uint8_t* data, size_t size, int64_t ptsUs);
 
         // Latest decoded frame's AHB, or nullptr. The returned AImage owns the AHB and

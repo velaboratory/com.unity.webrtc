@@ -1704,6 +1704,8 @@ namespace Unity.WebRTC
         [DllImport(WebRTC.Lib)]
         public static extern uint GetVideoRendererId(IntPtr sink);
         [DllImport(WebRTC.Lib)]
+        public static extern int GetRendererFrameIsNative(IntPtr sink);
+        [DllImport(WebRTC.Lib)]
         public static extern void DeleteVideoRenderer(IntPtr context, IntPtr sink);
         [DllImport(WebRTC.Lib)]
         public static extern void VideoTrackAddOrUpdateSink(IntPtr track, IntPtr sink);

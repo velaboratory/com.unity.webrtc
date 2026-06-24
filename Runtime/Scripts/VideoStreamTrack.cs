@@ -492,7 +492,10 @@ namespace Unity.WebRTC
 
             var format = WebRTC.GetSupportedGraphicsFormat(SystemInfo.graphicsDeviceType);
 #if UNITY_ANDROID && !UNITY_EDITOR
-            if (NativeMethods.GetAhbDisplayMode() >= 2)
+            // Zero-copy display only for decoders that deliver native (AHB) frames. A software decoder
+            // (libvpx VP8) delivers I420, which the AHB compute display ignores — give it the standard
+            // Texture2D + CPU upload path instead, picked per-track from the first frame's buffer type.
+            if (NativeMethods.GetAhbDisplayMode() >= 2 && NativeMethods.GetRendererFrameIsNative(self) != 0)
             {
                 // Zero-copy receive: a RenderTexture with random-write (UAV/storage) so the
                 // native AHB convert compute pass writes the decoded RGBA straight into it
