@@ -18,11 +18,13 @@ CONTRIBUTING.md.meta
 QAReport.md
 QAReport.md.meta
 .gitlab-ci.yml
+.yamato
 build.sh
 build.sh.meta
 build.bat
 build.bat.meta
 xray-exemptions.json
+TestRunnerOptions.json
 
 WebRTC~/**
 Tools/**
