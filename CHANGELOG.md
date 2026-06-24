@@ -4,6 +4,16 @@ All notable changes to the webrtc package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [3.0.7] - 2026-06-24 (VEL fork)
+
+### Fixed
+
+- **Android Player build failed on registry installs.** The published package shipped the upstream
+  `TestRunnerOptions.json` (and `.yamato/`) without `.meta` files; in an immutable PackageCache Unity
+  can't generate them and logs *"asset has no meta file … will be ignored"* at **Error** level, which
+  counts toward `Error building Player` and fails the build (it was silent on a `file:` ref because Unity
+  generated the `.meta` locally). Both are now excluded via `.npmignore` so they aren't published.
+
 ## [3.0.6] - 2026-06-24 (VEL fork)
 
 ### Added
