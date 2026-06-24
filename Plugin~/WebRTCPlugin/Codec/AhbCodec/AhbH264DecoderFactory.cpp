@@ -123,24 +123,32 @@ namespace webrtc
                     m_wasPaused = true;
                     return WEBRTC_VIDEO_CODEC_OK;
                 }
-                // On resume, wait for a keyframe before decoding (C# asks the SFU for one),
-                // so we don't feed MediaCodec P-frames whose references we skipped.
+                // On resume we skipped frames while paused, so the next decodable frame must be a keyframe.
                 if (m_wasPaused)
                 {
                     AHB_LOG("decode RESUME (await keyframe) decoder=%llu", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
                     m_wasPaused = false;
                     m_needKeyframe = true;
                 }
+                // libwebrtc detected a gap before this frame (NACK couldn't recover a reference): a delta is
+                // now undecodable. Don't pretend it decoded — require a keyframe, exactly like the stock
+                // decoder, so the receive stream emits an RTCP PLI itself. This is what makes recovery native
+                // (no C# watchdog): always-returning-OK is what told libwebrtc "decoded fine, no keyframe".
+                if (missing_frames && input._frameType != ::webrtc::VideoFrameType::kVideoFrameKey)
+                    m_needKeyframe = true;
+
                 if (m_needKeyframe)
                 {
                     if (input._frameType == ::webrtc::VideoFrameType::kVideoFrameKey)
                         m_needKeyframe = false;
                     else
-                        return WEBRTC_VIDEO_CODEC_OK; // hold last frame until the keyframe
+                        // Undecodable until a keyframe — ask libwebrtc to request one (it sends the PLI).
+                        // keyframe_required_ then makes the frame buffer drop deltas, so this fires sparsely.
+                        return WEBRTC_VIDEO_CODEC_OK_REQUEST_KEYFRAME;
                 }
 
                 NativeDecode(input);
-                return WEBRTC_VIDEO_CODEC_OK; // recovery is libwebrtc's own (RTP/frame buffer)
+                return WEBRTC_VIDEO_CODEC_OK;
             }
 
             int32_t RegisterDecodeCompleteCallback(::webrtc::DecodedImageCallback* callback) override

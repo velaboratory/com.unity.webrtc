@@ -4,6 +4,25 @@ All notable changes to the webrtc package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [3.0.5] - 2026-06-24 (VEL fork)
+
+### Fixed
+
+- **Encoder crash (`EncoderQueue` SIGSEGV).** `VideoFrameAdapter::ConvertToVideoFrameBuffer` dereferenced
+  a null GPU buffer — either `GetGpuMemoryBuffer()` was null, or `gmb->ToI420()` returned null on a failed
+  `WaitSync` (the texture hadn't been uploaded yet) — when a frame reached the encoder before its GPU data
+  was ready (e.g. an SFU forces an immediate keyframe the instant publishing starts while a subscriber is
+  already watching). The release-stripped `RTC_DCHECK` never caught it. Now returns a transient black
+  `I420Buffer` instead of dereferencing null.
+- **Receive-side freeze on packet/keyframe loss.** The AHB H.264 decoder always returned
+  `WEBRTC_VIDEO_CODEC_OK` and ignored `missing_frames`, so libwebrtc believed every frame decoded and
+  never requested a keyframe — a lost reference froze the stream until an external watchdog poked the SFU.
+  The decoder now honors `missing_frames` and returns `WEBRTC_VIDEO_CODEC_OK_REQUEST_KEYFRAME` while it
+  needs a keyframe, so libwebrtc emits the RTCP PLI itself (native NACK/PLI recovery, no watchdog).
+- **Resume crash (`UnityMain` SIGSEGV).** `GetVideoRendererId` dereferenced a null `UnityVideoRenderer`
+  when a C# `VideoStreamTrack` polled `RendererId` after the native renderer was torn down on app resume.
+  Now null-safe (returns 0).
+
 ## [3.0.4] - 2026-06-21 (VEL fork)
 
 ### Added

@@ -1,5 +1,6 @@
 #include "pch.h"
 
+#include <api/video/i420_buffer.h>
 #include <api/video/video_frame.h>
 
 #include "VideoFrameAdapter.h"
@@ -120,11 +121,25 @@ namespace webrtc
         if (i420Buffer_)
             return i420Buffer_;
 
-        RTC_DCHECK(video_frame);
-        RTC_DCHECK(video_frame->HasGpuMemoryBuffer());
+        // A frame can reach the encoder before its GPU data is ready — e.g. when a subscriber is already
+        // on the SFU, publishing forces an immediate keyframe the instant the track starts, racing the
+        // first captured frame. Two failure modes, both of which crashed the EncoderQueue thread in a
+        // release build (RTC_DCHECK is a no-op there): GetGpuMemoryBuffer() is null, OR gmb->ToI420()
+        // returns null because GpuMemoryBufferFromUnity::ToI420 hit a failed WaitSync (texture not
+        // uploaded yet) — the caller then dereferenced that null. Cover BOTH: encode a transient black
+        // frame (NOT cached, so the next ready frame converts normally).
+        auto gmb = video_frame ? video_frame->GetGpuMemoryBuffer() : nullptr;
+        rtc::scoped_refptr<I420BufferInterface> i420 = gmb ? gmb->ToI420() : nullptr;
+        if (i420 == nullptr)
+        {
+            int w = size_.width() > 0 ? size_.width() : 2;
+            int h = size_.height() > 0 ? size_.height() : 2;
+            auto black = ::webrtc::I420Buffer::Create(w, h);
+            ::webrtc::I420Buffer::SetBlack(black.get());
+            return black;
+        }
 
-        auto gmb = video_frame->GetGpuMemoryBuffer();
-        i420Buffer_ = gmb->ToI420();
+        i420Buffer_ = i420;
         return i420Buffer_;
     }
 

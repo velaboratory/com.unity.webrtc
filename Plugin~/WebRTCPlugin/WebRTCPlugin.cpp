@@ -416,7 +416,10 @@ extern "C"
         return context->CreateVideoRenderer(callback, needFlipVertical);
     }
 
-    UNITY_INTERFACE_EXPORT uint32_t GetVideoRendererId(UnityVideoRenderer* sink) { return sink->GetId(); }
+    // Null-safe: on app resume the native renderer can be torn down while a C# VideoStreamTrack still
+    // pokes RendererId every frame (velshareunity's visibility check). Return 0 ("no renderer") instead
+    // of dereferencing a null sink and crashing UnityMain.
+    UNITY_INTERFACE_EXPORT uint32_t GetVideoRendererId(UnityVideoRenderer* sink) { return sink ? sink->GetId() : 0; }
 
     UNITY_INTERFACE_EXPORT void DeleteVideoRenderer(Context* context, UnityVideoRenderer* sink)
     {

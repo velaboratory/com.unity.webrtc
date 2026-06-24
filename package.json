@@ -1,7 +1,7 @@
 {
   "name": "com.unity.webrtc",
   "displayName": "WebRTC (VEL zero-copy)",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "unity": "6000.0",
   "description": "The WebRTC package provides browsers and mobile applications with Real-Time Communications (RTC) capabilities.",
   "keywords": [
