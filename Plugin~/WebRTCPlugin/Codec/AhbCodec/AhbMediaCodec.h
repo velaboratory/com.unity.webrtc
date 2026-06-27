@@ -48,7 +48,10 @@ namespace webrtc
         bool IsStarted() const { return m_started; }
 
     private:
-        void PumpOutput();
+        // Pumps decoder output to the AImageReader. Returns false if the codec returned a
+        // hard error (e.g. the framework ResourceManager reclaimed it under load) — the
+        // caller must tear it down and reconfigure rather than keep polling a dead codec.
+        bool PumpOutput();
 
         AMediaCodec* m_codec = nullptr;
         AImageReader* m_reader = nullptr;

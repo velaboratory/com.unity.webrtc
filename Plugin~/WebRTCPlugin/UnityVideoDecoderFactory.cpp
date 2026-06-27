@@ -91,13 +91,48 @@ namespace webrtc
 
     std::vector<webrtc::SdpVideoFormat> UnityVideoDecoderFactory::GetSupportedFormats() const
     {
-        return GetSupportedFormatsInFactories(factories_);
+        auto formats = GetSupportedFormatsInFactories(factories_);
+
+        // On macOS/iOS the platform decoder factory (VideoToolbox) advertises ONLY H.264 Constrained
+        // Baseline (42e01f) + Constrained High (640c1f) — even though VideoToolbox decodes plain High fine.
+        // Browser HARDWARE H.264 encoders (Chrome/macOS VideoToolbox) only emit Baseline/Main/High, NEVER
+        // Constrained Baseline, so without High advertised here a hardware-encoded stream negotiates to
+        // nothing in the Editor. Advertise High (640034) when VideoToolbox H.264 is present; CreateVideoDecoder
+        // routes an unmatched High request to VideoToolbox (it decodes the High bitstream regardless of the
+        // SDP profile). On Android the AHB factory already advertises High, so this dedups to a no-op there.
+        if (factories_.count(kVideoToolboxImpl) > 0)
+        {
+            webrtc::SdpVideoFormat high(
+                "H264",
+                { { "profile-level-id", "640034" },
+                  { "level-asymmetry-allowed", "1" },
+                  { "packetization-mode", "1" } });
+            bool present = false;
+            for (const auto& f : formats)
+                if (f.IsSameCodec(high)) { present = true; break; }
+            if (!present)
+            {
+                high.parameters.emplace(kSdpKeyNameCodecImpl, std::string(kVideoToolboxImpl));
+                formats.push_back(high);
+            }
+        }
+        return formats;
     }
 
     std::unique_ptr<webrtc::VideoDecoder>
     UnityVideoDecoderFactory::CreateVideoDecoder(const webrtc::SdpVideoFormat& format)
     {
         VideoDecoderFactory* factory = FindCodecFactory(factories_, format);
+        if (!factory)
+        {
+            // The High (640034) we advertise above has no sub-factory that lists it (the objc VideoToolbox
+            // factory exposes only CB+CH), but VideoToolbox decodes High fine — route unmatched H.264 to it.
+            auto it = factories_.find(kVideoToolboxImpl);
+            if (it != factories_.end() && format.name == "H264")
+                factory = it->second.get();
+        }
+        if (!factory)
+            return nullptr;
         auto decoder = factory->CreateVideoDecoder(format);
         if (!profiler_)
             return decoder;

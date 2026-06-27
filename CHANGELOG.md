@@ -4,6 +4,50 @@ All notable changes to the webrtc package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [3.0.8] - 2026-06-27 (VEL fork)
+
+### Added
+
+- **macOS H.264 High advertised for VideoToolbox decode** (`UnityVideoDecoderFactory`). When the
+  macOS/iOS VideoToolbox factory is present, advertise H.264 High (`640034`) and route an unmatched H.264
+  `CreateVideoDecoder` request to VideoToolbox (it decodes High fine). Browser hardware H.264 encoders
+  (Chrome/macOS VideoToolbox) emit only Baseline/Main/High — never Constrained Baseline — so without this
+  an Editor viewer negotiated a hardware-encoded stream to nothing. No-op on Android (the AHB factory
+  already advertises High).
+
+### Changed
+
+- **AHB decoder always decodes every subscribed stream** (removed off-screen decode-pause). Pausing the HW
+  decoder on look-away and forcing a keyframe on resume caused a visible glitch on every glance in VR.
+- **AHB recovery is codec-agnostic and `missing_frames`-independent.** On any decode failure the decoder
+  self-resets (releases the HW codec, re-requires a keyframe) and returns ERROR so libwebrtc requests a
+  keyframe; the codec reconfigures on the next keyframe. Replaces the `missing_frames`-driven path, which
+  never fired for AV1 without the Dependency Descriptor — AV1 corrupted persistently until a natural
+  keyframe (desktop recovered, Quest did not). Validated clean at 12×1080p60 AV1.
+
+### Fixed
+
+- **Hard codec-fault recovery** (e.g. framework ResourceManager reclaim). This M116 `VideoReceiveStream2`
+  does not re-init a decoder on a returned ERROR — it only requests a keyframe — so a faulted HW codec was
+  re-fed forever (permanent black board). The decoder now releases its codec on a decode fault so the next
+  frame reconfigures it.
+- **Input-buffer starvation no longer silently drops NALs.** `AhbMediaCodec::DecodeNal` waits up to 500 ms
+  (stock `DEQUEUE_INPUT_TIMEOUT_US`) for an input buffer and signals failure instead of dropping the frame
+  and returning OK (the old timeout-0 drop broke the reference chain with no recovery).
+- **AImageReader pool 8→12** so the decoder keeps enough render buffers under 6×1440p / many concurrent
+  1080p streams (the consumer holds ~5; 8 left only 3, which starved and flooded "Unsupported input buffer").
+- **Reap-before-create at the HW session cap.** Opening a decode session right at the cap (avc=16) could
+  transiently fail while a just-reset sibling's session was still reaping; `Configure` now retries with a
+  short backoff (and frees its AImageReader on give-up) instead of erroring into a reset storm at 15–16 streams.
+- **macOS 26 SDK build:** `libcxx/debug.cpp` is guarded with `#if __has_include(<__debug>)` (the obsolete
+  libc++ debug header was removed in newer toolchains; the prebuilt libwebrtc references none of its symbols).
+
+### Notes
+
+- Decoder-output AHB memory scales with the pool: ~37 MB/stream at 1080p, ~66 MB at 1440p. The shipped and
+  tested target is ≤12×1080p60; at a 1440p / 16-stream peak this is ~1 GB of AHBs alone on the shared 8 GB
+  Quest 3 — tune the pool down if you push past that.
+
 ## [3.0.7] - 2026-06-24 (VEL fork)
 
 ### Fixed

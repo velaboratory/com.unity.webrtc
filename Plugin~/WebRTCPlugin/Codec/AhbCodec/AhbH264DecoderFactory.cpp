@@ -106,6 +106,7 @@ namespace webrtc
                 }
                 AHB_LOG("Configure: native zero-copy decoder (mode=%d)", mode_);
                 inner_.reset(); // no stock-decoder session in the native path
+                m_keyFrameRequired = true; // stock: a freshly (re)inited decoder needs a keyframe first
                 return true;
             }
 
@@ -115,40 +116,39 @@ namespace webrtc
                 if (mode_ < 2)
                     return inner_ ? inner_->Decode(input, missing_frames, render_time_ms) : WEBRTC_VIDEO_CODEC_ERROR;
 
-                // Off-screen: skip the MediaCodec decode entirely (idles the HW decoder).
-                // RTP still arrives, but no decode work — the big per-stream cost.
-                if (m_paused.load(std::memory_order_relaxed))
-                {
-                    if (!m_wasPaused)
-                        AHB_LOG("decode PAUSED (off-screen) decoder=%llu", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
-                    m_wasPaused = true;
-                    return WEBRTC_VIDEO_CODEC_OK;
-                }
-                // On resume we skipped frames while paused, so the next decodable frame must be a keyframe.
-                if (m_wasPaused)
-                {
-                    AHB_LOG("decode RESUME (await keyframe) decoder=%llu", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
-                    m_wasPaused = false;
-                    m_needKeyframe = true;
-                }
-                // libwebrtc detected a gap before this frame (NACK couldn't recover a reference): a delta is
-                // now undecodable. Don't pretend it decoded — require a keyframe, exactly like the stock
-                // decoder, so the receive stream emits an RTCP PLI itself. This is what makes recovery native
-                // (no C# watchdog): always-returning-OK is what told libwebrtc "decoded fine, no keyframe".
-                if (missing_frames && input._frameType != ::webrtc::VideoFrameType::kVideoFrameKey)
-                    m_needKeyframe = true;
+                // Off-screen pause REMOVED: every stream decodes and displays continuously, always.
+                // (The pause/resume path caused decode+convert load to spike the moment a board came
+                // into view and forced a keyframe wait on resume; a constant load is more predictable
+                // and it never actually freed the HW decode session anyway.)
 
-                if (m_needKeyframe)
+                // Codec-agnostic recovery (H264/VP9/AV1, DD or not — deliberately ignores `missing_frames`,
+                // which never fires for AV1 without the DD). Two parts:
+                //   1) after a (re)init, require a keyframe — drop deltas as NO_OUTPUT until one arrives;
+                //   2) on a decode failure we SELF-RESET (below) and return ERROR. IMPORTANT: this M116
+                //      VideoReceiveStream2 does NOT Release()+InitDecode() the decoder on ERROR — it only
+                //      asks the sender for a keyframe. So we must drop the HW codec ourselves; the next
+                //      Decode's !IsStarted() branch reconfigures it and the keyframe restarts decoding.
+                if (m_keyFrameRequired)
                 {
-                    if (input._frameType == ::webrtc::VideoFrameType::kVideoFrameKey)
-                        m_needKeyframe = false;
-                    else
-                        // Undecodable until a keyframe — ask libwebrtc to request one (it sends the PLI).
-                        // keyframe_required_ then makes the frame buffer drop deltas, so this fires sparsely.
-                        return WEBRTC_VIDEO_CODEC_OK_REQUEST_KEYFRAME;
+                    if (input._frameType != ::webrtc::VideoFrameType::kVideoFrameKey)
+                        return WEBRTC_VIDEO_CODEC_NO_OUTPUT; // stock: "key frame required first"
+                    m_keyFrameRequired = false;
+                    AHB_LOG("Decode: keyframe in -> decoding (dec=%llu)",
+                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
                 }
 
-                NativeDecode(input);
+                if (!NativeDecode(input))
+                {
+                    // Self-reset: libwebrtc won't reinit us on ERROR (see above), so drop the HW codec
+                    // (m_started -> false; the next Decode's !IsStarted() branch reconfigures) and re-require
+                    // a keyframe so deltas stall until the one we request lands. Without this a hard-faulted
+                    // codec (e.g. framework ResourceManager reclaim) is re-fed forever -> permanent black board.
+                    codec_.Release();
+                    m_keyFrameRequired = true;
+                    AHB_LOG("Decode: NativeDecode failed -> reset codec + require keyframe dec=%llu",
+                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
+                    return WEBRTC_VIDEO_CODEC_ERROR;
+                }
                 return WEBRTC_VIDEO_CODEC_OK;
             }
 
@@ -230,19 +230,19 @@ namespace webrtc
                 bool valid = false;
             };
 
-            void NativeDecode(const ::webrtc::EncodedImage& input)
+            bool NativeDecode(const ::webrtc::EncodedImage& input)
             {
                 if (!vkReady_)
                 {
                     const UnityVulkanInstance* vk = GetUnityVulkanInstance();
                     if (!vk)
-                        return; // not Vulkan, or gfx device not up yet
+                        return true; // not Vulkan / gfx not up yet — not a decode failure
                     if (!importer_.Init(vk->device))
                     {
                         if (!loggedNoImport_)
                             AHB_LOG("AHB import extension unavailable — native decode disabled");
                         loggedNoImport_ = true;
-                        return;
+                        return true; // AHB unavailable — don't drive libwebrtc into a reset loop
                     }
                     vkReady_ = true;
                 }
@@ -266,19 +266,23 @@ namespace webrtc
                     if (!codec_.Configure(w, h, mime_.c_str()))
                     {
                         AHB_LOG("AhbMediaCodec.Configure(%s %dx%d) failed", mime_.c_str(), w, h);
-                        return;
+                        return false; // can't (re)create the codec -> ERROR -> libwebrtc resets + re-keys
                     }
                     cfgW_ = w;
                     cfgH_ = h;
                 }
 
                 const int64_t ptsUs = static_cast<int64_t>(input.Timestamp()) * 1000000 / 90000;
-                codec_.DecodeNal(input.data(), input.size(), ptsUs);
+                if (!codec_.DecodeNal(input.data(), input.size(), ptsUs))
+                    // Decoder couldn't take the input (no HW buffers / falling behind) or hard-faulted (e.g.
+                    // the framework ResourceManager reclaimed it). Return failure; Decode() turns this into a
+                    // self-reset (release codec + require keyframe) + ERROR. We never silently drop/self-conceal.
+                    return false;
 
                 AImage* img = nullptr;
                 AHardwareBuffer* ahb = codec_.AcquireLatest(&img);
                 if (!ahb)
-                    return; // decoder warming up / no new frame this tick
+                    return true; // decoder warming up / no new frame this tick — not a failure
 
                 // Frame dimensions: the input's exact encoded size when present (no codec padding);
                 // otherwise (AV1/H265) the MediaCodec's reported size, learned on format change.
@@ -293,13 +297,13 @@ namespace webrtc
                 if (!importer_.EnsureConversion(ahb))
                 {
                     AhbMediaCodec::ReleaseImage(img);
-                    return;
+                    return true; // display-side (ycbcr) setup — the frame DID decode, not a reset case
                 }
                 AhbFrameImage fi;
                 if (!importer_.ImportImage(ahb, static_cast<uint32_t>(dw), static_cast<uint32_t>(dh), &fi))
                 {
                     AhbMediaCodec::ReleaseImage(img);
-                    return;
+                    return true; // display-side import — the frame DID decode
                 }
 
                 // Stash for the render-thread convert.
@@ -329,6 +333,7 @@ namespace webrtc
                                                      .build();
                     realCallback_->Decoded(frame);
                 }
+                return true;
             }
 
             void NativeRelease()
@@ -349,6 +354,7 @@ namespace webrtc
                 vkReady_ = false;
                 cfgW_ = 0;
                 cfgH_ = 0;
+                m_keyFrameRequired = true; // a reinit after release must wait for a keyframe (stock)
             }
 
             std::unique_ptr<::webrtc::VideoDecoder> inner_; // delegate, only used in mode<2
@@ -366,15 +372,10 @@ namespace webrtc
             int convOk_ = 0;
             int mode_ = 3;
 
-        public:
-            // Set from AhbSetStreamVisible (main thread) when the board goes off/on screen;
-            // read on the decode thread. Atomic so no per-frame lock on the decode path.
-            void SetPaused(bool paused) { m_paused.store(paused, std::memory_order_relaxed); }
-
         private:
-            std::atomic<bool> m_paused{ false };
-            bool m_wasPaused = false;  // decode thread only
-            bool m_needKeyframe = false; // decode thread only
+            // Matches libwebrtc stock AndroidVideoDecoder's keyFrameRequired: true on (re)init, makes us
+            // drop deltas (NO_OUTPUT) until a keyframe is decoded, then cleared. (decode thread only)
+            bool m_keyFrameRequired = true;
         };
 
         class AhbH264DecoderFactory : public ::webrtc::VideoDecoderFactory
@@ -388,14 +389,42 @@ namespace webrtc
 
             std::vector<::webrtc::SdpVideoFormat> GetSupportedFormats() const override
             {
-                // Advertise exactly what the platform HW decoder factory supports (H264, VP9, AV1). We do
-                // NOT add VP8: the Quest has no HW VP8 decoder, and routing it through our AHB MediaCodec
-                // produces a broken chroma plane (green). VP8 is left to libwebrtc's internal libvpx decoder
-                // (kInternalImpl) + the standard (non-zero-copy) Texture2D upload — its I420 output can't go
-                // through the AHB zero-copy compute display anyway. The per-track display switch (a Texture2D
-                // when the decoder isn't delivering native AHB frames) is what makes that work. (H265 is also
-                // absent: this libwebrtc build has no HEVC codec support at all.)
-                return android_ ? android_->GetSupportedFormats() : std::vector<::webrtc::SdpVideoFormat>();
+                // Start from what the platform HW decoder factory advertises (H264 Constrained Baseline,
+                // VP9, AV1). We do NOT add VP8: the Quest has no HW VP8 decoder, and routing it through our
+                // AHB MediaCodec produces a broken chroma plane (green). VP8 is left to libwebrtc's internal
+                // libvpx decoder (kInternalImpl) + the standard (non-zero-copy) Texture2D upload — its I420
+                // output can't go through the AHB zero-copy compute display anyway. The per-track display
+                // switch (a Texture2D when the decoder isn't delivering native AHB frames) is what makes that
+                // work. (H265 is also absent: this libwebrtc build has no HEVC codec support at all.)
+                auto formats = android_ ? android_->GetSupportedFormats() : std::vector<::webrtc::SdpVideoFormat>();
+
+                // Add H264 High + Constrained High. The platform Java factory (HardwareVideoDecoderFactory)
+                // only marks H264 High-capable when the decoder NAME starts with "OMX.qcom."/"OMX.Exynos." —
+                // a legacy check that misses the Quest's Codec2 decoder "c2.qti.avc.decoder", so it
+                // advertises Constrained Baseline (42e01f) ONLY. But the Quest's HW AVC decoder DOES decode
+                // High / Constrained High / Main (verified on-device: MediaCodecList reports
+                // c2.qti.avc.decoder hardwareAccelerated, profiles Baseline/CB/Main/High/ConstrainedHigh to
+                // Level 6.2). Without these advertised, a browser HARDWARE H.264 encoder — e.g. Chrome/macOS
+                // VideoToolbox, which emits High/Constrained-High — negotiates to nothing here and shows no
+                // video on Quest. The AHB pipeline is profile-agnostic (it maps "H264" -> "video/avc" and
+                // the MediaCodec reads the real profile from the SPS), and level-asymmetry-allowed=1 keeps
+                // the advertised level (5.2) from capping a sender that runs higher.
+                for (const char* plid : { "640c34" /*Constrained High, 5.2*/, "640034" /*High, 5.2*/ })
+                {
+                    ::webrtc::SdpVideoFormat f(
+                        "H264",
+                        { { "profile-level-id", plid },
+                          { "level-asymmetry-allowed", "1" },
+                          { "packetization-mode", "1" } });
+                    bool present = false;
+                    for (const auto& g : formats)
+                        if (g.IsSameCodec(f)) { present = true; break; }
+                    if (present)
+                        continue;
+                    AHB_LOG("GetSupportedFormats: + H264 %s (Quest HW decodes it; platform factory omitted it)", plid);
+                    formats.push_back(f);
+                }
+                return formats;
             }
 
             std::unique_ptr<::webrtc::VideoDecoder>
@@ -452,23 +481,9 @@ namespace webrtc
         AHB_LOG("map renderer %u -> decoder %llu", rendererId, decoderId);
     }
 
-    // C# visibility hook: pause/resume the decoder feeding this renderer's board.
-    void AhbSetStreamVisible(unsigned int rendererId, int visible)
-    {
-        std::lock_guard<std::mutex> lock(g_convertMutex);
-        auto it = g_rendererToDecoder.find(rendererId);
-        if (it == g_rendererToDecoder.end())
-        {
-            AHB_LOG("SetVisible rid=%u vis=%d -> NO MAPPING yet", rendererId, visible);
-            return;
-        }
-        AhbH264Decoder* d = reinterpret_cast<AhbH264Decoder*>(static_cast<uintptr_t>(it->second));
-        bool live = g_liveDecoders.find(d) != g_liveDecoders.end();
-        AHB_LOG("SetVisible rid=%u vis=%d -> decoder %llu live=%d", rendererId, visible,
-            static_cast<unsigned long long>(it->second), live ? 1 : 0);
-        if (live)
-            d->SetPaused(visible == 0);
-    }
+    // C# visibility hook — now a NO-OP. Every stream decodes and displays continuously regardless of
+    // on/off-screen state. Kept as an exported symbol so existing C# callers still link cleanly.
+    void AhbSetStreamVisible(unsigned int /*rendererId*/, int /*visible*/) {}
 
     bool AhbConvertDecoderInto(
         unsigned long long id, void* cmd, void* dstImage, unsigned long long curFrame, unsigned long long safeFrame)

@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include <cstring>
+#include <unistd.h> // usleep — reap-before-create backoff
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
@@ -23,15 +24,34 @@ namespace webrtc
 
     namespace
     {
+        // Wait up to this long for a free input buffer before treating a frame as undecodable — matches
+        // libwebrtc's stock AndroidVideoDecoder DEQUEUE_INPUT_TIMEOUT_US (500 ms). Each receive stream
+        // decodes on its own thread, so this only ever blocks the single stream that's backed up.
+        constexpr int64_t kDequeueInputTimeoutUs = 500000;
+
+        // Reap-before-create retry: if opening a decode session fails at the concurrent-session cap
+        // (a just-reset sibling's session hasn't reaped yet — venus_hfi_session_close is async), retry
+        // up to this many times with this backoff so the slot frees first. ~8 x 50ms = 400ms max, only
+        // ever on a reset right at the cap; the common case succeeds on attempt 1.
+        constexpr int kConfigureRetries = 8;
+        constexpr int kConfigureRetryDelayUs = 50000; // 50 ms
+
         // Create an AImageReader (GPU-sampled AHBs the decoder renders into, zero copy) + its window.
-        // maxImages 8 covers the convert ring (4) + the stashed pending frame + an acquire transient.
+        // The consumer side holds up to (1 stashed pending + kRing=4 in-flight GPU converts) = 5 of these
+        // at once, so the pool size minus 5 is what the decoder gets to RENDER into. At 8 the decoder had
+        // only 3 (== the CCodec numClientBuffers(3) seen in logcat); under 6x1440p60 those 3 starve, the
+        // decoder can't dequeue a free output buffer, and DecodeNal then drops the next NAL -> reference
+        // chain breaks -> visual corruption + "QC2V4L2PollThread Unsupported input buffer" floods. 12
+        // leaves the decoder 7, more than doubling its headroom. Cost ~ width*height*1.5 bytes per extra
+        // buffer per stream (≈5.5 MB @1440p); keep this modest if you run many (12+) concurrent streams.
+        static const int kReaderImages = 12;
         bool MakeReader(int width, int height, AImageReader** outReader, ANativeWindow** outWindow)
         {
             *outReader = nullptr;
             *outWindow = nullptr;
             AImageReader* reader = nullptr;
             media_status_t st = AImageReader_newWithUsage(
-                width, height, AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 8, &reader);
+                width, height, AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, kReaderImages, &reader);
             if (st != AMEDIA_OK || !reader)
             {
                 AHB_LOG("AImageReader_newWithUsage(%dx%d) failed (%d)", width, height, static_cast<int>(st));
@@ -60,33 +80,54 @@ namespace webrtc
         if (!MakeReader(width, height, &m_reader, &m_window))
             return false;
 
-        m_codec = AMediaCodec_createDecoderByType(mime);
-        if (!m_codec)
+        // Reap-before-create: a just-reset sibling decoder's HW session can linger briefly
+        // (venus_hfi_session_close is async), so opening a new session right at the concurrent-session
+        // cap (avcd=16) transiently fails with ENOMEM ("sessions exceeded max limit"). Erroring there
+        // makes libwebrtc reset us into a cap-churn STORM at 15-16 streams. Instead, retry with a short
+        // backoff so the lingering session reaps first — effectively waiting for a slot before creating
+        // ours. Only a genuinely-full cap (no slot frees within the window) still fails.
+        for (int attempt = 1; attempt <= kConfigureRetries; ++attempt)
         {
-            AHB_LOG("AMediaCodec_createDecoderByType(%s) failed", mime);
-            return false;
+            m_codec = AMediaCodec_createDecoderByType(mime);
+            if (m_codec)
+            {
+                AMediaFormat* fmt = AMediaFormat_new();
+                AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, mime);
+                AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, width);
+                AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, height);
+                AMediaFormat_setInt32(fmt, "low-latency", 1);
+                media_status_t cs = AMediaCodec_configure(m_codec, fmt, m_window, nullptr, 0);
+                AMediaFormat_delete(fmt);
+                if (cs == AMEDIA_OK && AMediaCodec_start(m_codec) == AMEDIA_OK)
+                {
+                    m_started = true;
+                    AHB_LOG("AhbMediaCodec up: %s %dx%d (attempt %d)", mime, width, height, attempt);
+                    return true;
+                }
+                AHB_LOG("AhbMediaCodec configure/start failed (%s %dx%d, attempt %d, cs=%d) — likely the "
+                        "session cap; reaping + retrying",
+                    mime, width, height, attempt, static_cast<int>(cs));
+                AMediaCodec_delete(m_codec); // drop the half-open codec before retrying
+                m_codec = nullptr;
+            }
+            else
+            {
+                AHB_LOG("AMediaCodec_createDecoderByType(%s) failed (attempt %d)", mime, attempt);
+            }
+            if (attempt < kConfigureRetries)
+                usleep(kConfigureRetryDelayUs); // let a just-released sibling's HW session reap, then retry
         }
-
-        AMediaFormat* fmt = AMediaFormat_new();
-        AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, mime);
-        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, width);
-        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, height);
-        AMediaFormat_setInt32(fmt, "low-latency", 1);
-        media_status_t cs = AMediaCodec_configure(m_codec, fmt, m_window, nullptr, 0);
-        AMediaFormat_delete(fmt);
-        if (cs != AMEDIA_OK)
+        // All attempts failed: free the AImageReader/window we made up front (MakeReader, above) so a
+        // wedged stream doesn't pin a slot of the (now 12-image) pool until teardown.
+        m_window = nullptr; // owned by m_reader; deleting the reader frees it
+        if (m_reader)
         {
-            AHB_LOG("AMediaCodec_configure failed (%d)", static_cast<int>(cs));
-            return false;
+            AImageReader_delete(m_reader);
+            m_reader = nullptr;
         }
-        if (AMediaCodec_start(m_codec) != AMEDIA_OK)
-        {
-            AHB_LOG("AMediaCodec_start failed");
-            return false;
-        }
-        m_started = true;
-        AHB_LOG("AhbMediaCodec up: %s %dx%d (NDK AMediaCodec -> AImageReader)", mime, width, height);
-        return true;
+        AHB_LOG("AhbMediaCodec.Configure(%s %dx%d) failed after %d attempts (cap genuinely full?)",
+            mime, width, height, kConfigureRetries);
+        return false;
     }
 
     bool AhbMediaCodec::DecodeNal(const uint8_t* data, size_t size, int64_t ptsUs)
@@ -94,7 +135,11 @@ namespace webrtc
         if (!m_started || !m_codec)
             return false;
 
-        ssize_t inIdx = AMediaCodec_dequeueInputBuffer(m_codec, 0);
+        // Match stock AndroidVideoDecoder: wait ~500ms for an input buffer. If none is available the
+        // decoder is falling behind / faulted — return failure so Decode() returns ERROR and libwebrtc
+        // resets + re-keys. We never silently drop the frame (the old timeout-0 drop is what left AV1
+        // unable to recover from loss — the decoder concealed forever instead of signalling a failure).
+        ssize_t inIdx = AMediaCodec_dequeueInputBuffer(m_codec, kDequeueInputTimeoutUs);
         if (inIdx >= 0)
         {
             size_t bufSize = 0;
@@ -110,12 +155,18 @@ namespace webrtc
                 AMediaCodec_queueInputBuffer(m_codec, static_cast<size_t>(inIdx), 0, 0, 0, 0);
             }
         }
+        else
+        {
+            // No input buffer after the timeout (-1) or a hard error (e.g. ResourceManager reclaim) —
+            // "decoder falling behind"; signal failure so libwebrtc tears us down and requests a keyframe.
+            AHB_LOG("dequeueInputBuffer no buffer/err %zd — decoder falling behind (reset)", inIdx);
+            return false;
+        }
 
-        PumpOutput();
-        return true;
+        return PumpOutput();
     }
 
-    void AhbMediaCodec::PumpOutput()
+    bool AhbMediaCodec::PumpOutput()
     {
         AMediaCodecBufferInfo info;
         for (;;)
@@ -177,11 +228,21 @@ namespace webrtc
             {
                 continue;
             }
+            else if (outIdx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)
+            {
+                break; // no output ready this pump — normal
+            }
             else
             {
-                break; // AMEDIACODEC_INFO_TRY_AGAIN_LATER
+                // Any other negative is a hard error (media_status_t < 0): the codec was
+                // released/reclaimed or faulted. Stop polling it — returning false makes the
+                // caller tear down + reconfigure instead of spamming "Invalid to call at
+                // Released state" every frame against a dead codec.
+                AHB_LOG("dequeueOutputBuffer error %zd — codec needs reset", outIdx);
+                return false;
             }
         }
+        return true;
     }
 
     AHardwareBuffer* AhbMediaCodec::AcquireLatest(AImage** outImage)

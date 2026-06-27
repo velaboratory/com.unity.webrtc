@@ -17,6 +17,11 @@
 //===----------------------------------------------------------------------===//
 
 
+// <__debug> is the obsolete libc++ debug-mode header, removed from libc++ (~LLVM 17 / Apple clang 16+,
+// absent in the macOS 26 SDK). The prebuilt libwebrtc references none of these symbols (verified: 0
+// undefined refs), so guarding the whole TU compiles it to nothing on newer toolchains while leaving it
+// intact for the CI's older one (and the Android NDK, which still ships <__debug>).
+#if __has_include(<__debug>)
 #include "__config"
 #include "__debug"
 #include "functional"
@@ -595,3 +600,5 @@ __c_node::__remove(__i_node* p)
 #endif // defined(USE_DEBUG_MODE)
 
 _LIBCPP_END_NAMESPACE_STD
+
+#endif // __has_include(<__debug>)

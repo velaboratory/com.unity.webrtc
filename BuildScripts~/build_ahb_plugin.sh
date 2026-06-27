@@ -15,7 +15,9 @@ ANDROID_NDK="$UNITY/NDK"
 CMAKE="$UNITY/SDK/cmake/3.22.1/bin/cmake"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)/Plugin~"
 SO_OUT="$(cd "$(dirname "$0")/.." && pwd)/Runtime/Plugins/Android/libwebrtc.so"
-AAR="$HOME/git_repo/coannotate/Packages/com.unity.webrtc/Runtime/Plugins/Android/libwebrtc.aar"
+# Ship into THIS package's own .aar (consumers use it directly via a file: ref). Was a stale
+# hardcoded coannotate PackageCache path that no longer exists.
+AAR="$(cd "$(dirname "$0")/.." && pwd)/Runtime/Plugins/Android/libwebrtc.aar"
 
 cd "$PLUGIN_DIR"
 if [ ! -d build-arm64 ]; then
