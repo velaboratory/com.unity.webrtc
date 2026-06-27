@@ -365,9 +365,16 @@ static void UNITY_INTERFACE_API OnBatchUpdateEvent(int eventID, void* data)
             if (!renderer || !s_unityVulkan)
                 continue;
             auto buf = renderer->GetFrameBuffer();
-            if (!buf || buf->type() != webrtc::VideoFrameBuffer::Type::kNative)
-                continue; // no new frame this tick
-            uint64_t decoderId = static_cast<AhbDisplayBuffer*>(buf.get())->DecoderId();
+            uint64_t decoderId = 0;
+            if (buf && buf->type() == webrtc::VideoFrameBuffer::Type::kNative)
+                decoderId = static_cast<AhbDisplayBuffer*>(buf.get())->DecoderId();
+            else if (renderer->LastFrameWasNative())
+                // Starved tick: no new frame this Unity frame (e.g. the large IDR is still decoding on its
+                // own tick). Repaint this decoder's LAST frame so the UAV receive texture isn't left
+                // cleared — otherwise it reads alpha=0 and the board flashes transparent once per GOP.
+                decoderId = renderer->LastAhbDecoderId();
+            if (decoderId == 0)
+                continue; // software I420 path (customTextureUpload), or no AHB frame yet
 
             VkImageSubresource subres { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
             s_unityVulkan->EnsureOutsideRenderPass();

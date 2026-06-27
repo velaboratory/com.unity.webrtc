@@ -4,6 +4,20 @@ All notable changes to the webrtc package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [3.0.9] - 2026-06-27 (VEL fork)
+
+### Fixed
+
+- **AHB zero-copy display: one transparent frame per keyframe.** With a fixed-GOP publisher (e.g. neko/NVENC
+  sending an IDR every ~1 s), the large keyframe sometimes hadn't finished decoding on its own render tick,
+  so `AcquireLatest` returned null, no frame was delivered, the render thread's Decode branch had nothing to
+  convert, and the UAV receive RenderTexture (cleared each tick) read alpha 0 — the board flashed
+  **transparent/see-through for exactly one frame each GOP**. (Confirmed isolated to this path: the stock
+  delegate decoder, `debug.ahb.mode 1`, was clean; the published stream + SFU were provably fine.) Fix:
+  on a starved tick the renderer now repaints the decoder's **last** frame (HOLD-LAST) — keyed by the
+  cached `LastAhbDecoderId()` — so the texture is never left cleared, mirroring what the stock SurfaceTexture
+  does for free. Files: `UnityRenderEvent.cpp`, `UnityVideoRenderer.h`, `AhbCodec/AhbH264DecoderFactory.cpp`.
+
 ## [3.0.8] - 2026-06-27 (VEL fork)
 
 ### Added

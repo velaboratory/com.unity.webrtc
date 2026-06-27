@@ -31,6 +31,13 @@ namespace webrtc
         // software decoders (libvpx VP8) whose I420 frames the AHB compute display can't consume.
         bool LastFrameWasNative() const { return m_lastFrameNative.load(std::memory_order_relaxed); }
 
+#if UNITY_ANDROID
+        // The AHB decoder feeding this renderer (0 until its first zero-copy frame). On a starved tick
+        // (no new frame this Unity frame) the render thread repaints this decoder's last frame so the
+        // receive texture isn't left cleared/transparent.
+        uint64_t LastAhbDecoderId() const { return m_lastMappedDecoder; }
+#endif
+
         // used in UnityRenderingExtEventUpdateTexture
         // called on RenderThread
         void* ConvertVideoFrameToTextureAndWriteToBuffer(int width, int height, libyuv::FourCC format);

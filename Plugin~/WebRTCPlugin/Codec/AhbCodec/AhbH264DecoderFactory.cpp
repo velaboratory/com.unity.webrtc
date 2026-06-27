@@ -188,7 +188,23 @@ namespace webrtc
             {
                 convert_.Reclaim(safeFrame);
                 if (!pending_.valid)
+                {
+                    // HOLD-LAST: no new decoded frame this tick (e.g. the large IDR hasn't finished decoding
+                    // on its own tick, so AcquireLatest returned null). The render thread still calls us with
+                    // the last decoderId — repaint the last frame so the UAV receive texture isn't left
+                    // CLEARED (alpha 0 => the board flashes transparent for one frame each GOP). On a starved
+                    // tick no new frame was decoded, so the last frame's AHB isn't recycled and its cached
+                    // VkImage is still valid; pass no retire (the importer owns that VkImage).
+                    if (haveLastFi_ && convert_.IsReady() && cmd != VK_NULL_HANDLE)
+                    {
+                        if (convert_.RecordInto(cmd, lastFi_.image, lastFi_.view, dstImage, lastFi_.width,
+                                lastFi_.height, curFrame, nullptr, nullptr) &&
+                            (++holdLast_ <= 5 || (holdLast_ % 120) == 0))
+                            AHB_LOG("HOLD-LAST repaint #%d %ux%u (starved tick)", holdLast_, lastFi_.width,
+                                lastFi_.height);
+                    }
                     return;
+                }
 
                 if (!convert_.IsReady())
                 {
@@ -218,8 +234,13 @@ namespace webrtc
                 {
                     AhbMediaCodec::ReleaseImage(img);
                 }
-                if (recorded && (++convOk_ <= 3 || (convOk_ % 600) == 0))
-                    AHB_LOG("convert #%d %ux%u", convOk_, fi.width, fi.height);
+                if (recorded)
+                {
+                    lastFi_ = fi;      // remember for HOLD-LAST repaints (the VkImage is cached in the importer)
+                    haveLastFi_ = true;
+                    if (++convOk_ <= 3 || (convOk_ % 600) == 0)
+                        AHB_LOG("convert #%d %ux%u", convOk_, fi.width, fi.height);
+                }
             }
 
         private:
@@ -370,6 +391,9 @@ namespace webrtc
             int cfgW_ = 0;
             int cfgH_ = 0;
             int convOk_ = 0;
+            int holdLast_ = 0;          // HOLD-LAST repaints (should fire ~1/GOP — the starved IDR tick)
+            AhbFrameImage lastFi_ = {}; // last converted frame; repainted on a starved tick (no new frame)
+            bool haveLastFi_ = false;
             int mode_ = 3;
 
         private:
